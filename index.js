@@ -29,7 +29,10 @@
 //   UW_KEY           (required)  UW API token (Advanced plan, WS-enabled)
 //   SESSION_SECRET   (required for prod)  same secret gex.js uses to sign pbj_session
 //   ALLOWED_ORIGIN   (default *) e.g. https://pbjcapital.net   — CORS origin for the dashboard
-//   SYMBOLS          (default "SPX,SPY,QQQ")  comma list to subscribe at boot
+//   SYMBOLS          (default "SPX,SPY,QQQ,IWM,NDX,DIA,AAPL,NVDA,TSLA")  always-warm core,
+//                    subscribed at boot. ANY other ticker is auto-subscribed on demand.
+//   MAX_DYNAMIC      (default 60)      cap on concurrent on-demand subscriptions
+//   IDLE_TTL_MS      (default 600000)  drop an on-demand sub after this long idle (10 min)
 //   PORT             (default 8080)  Railway injects this
 //   N_EXPIRIES       (default 5)     nearest expiries returned by default
 // ---------------------------------------------------------------------------
@@ -45,9 +48,15 @@ const UW_KEY         = process.env.UW_KEY;
 const PORT           = parseInt(process.env.PORT || '8080', 10);
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-const SYMBOLS        = (process.env.SYMBOLS || 'SPX,SPY,QQQ')
+// Always-warm CORE: subscribed at boot, never evicted (instant load for these).
+const CORE           = (process.env.SYMBOLS || 'SPX,SPY,QQQ,IWM,NDX,DIA,AAPL,NVDA,TSLA')
   .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 const N_EXPIRIES     = parseInt(process.env.N_EXPIRIES || '5', 10);
+// On-demand: ANY other ticker a member opens is auto-subscribed, then dropped once
+// idle. This makes the whole optionable universe available without holding thousands
+// of always-on streams.
+const MAX_DYNAMIC    = parseInt(process.env.MAX_DYNAMIC || '60', 10);     // cap on concurrent on-demand subs
+const IDLE_TTL_MS    = parseInt(process.env.IDLE_TTL_MS || '600000', 10); // drop a dynamic sub after this idle (10 min)
 
 const INDEX_LIKE  = new Set(['SPX', 'NDX', 'RUT', 'SPY', 'QQQ', 'IWM', 'DIA']);
 const BAND_INDEX  = 0.03;   // ±3% strike window for index-like
@@ -202,24 +211,36 @@ const sse = {};   // sym -> Map(res -> expCsv)
 
 app.get('/health', (_req, res) => {
   const now = Date.now();
+  const subs = Object.keys(subMeta).sort();
   const symbols = {};
-  for (const sym of SYMBOLS) {
+  for (const sym of subs) {
     const st = state[sym];
-    symbols[sym] = st
-      ? { cells: st.cells.size, spot: st.spot, lastMsgAgeMs: st.lastMsg ? now - st.lastMsg : null }
-      : { cells: 0, spot: 0, lastMsgAgeMs: null };
+    symbols[sym] = {
+      core: !!subMeta[sym].core,
+      cells: st ? st.cells.size : 0,
+      spot: st ? st.spot : 0,
+      lastMsgAgeMs: (st && st.lastMsg) ? now - st.lastMsg : null,
+      viewers: (sse[sym] && sse[sym].size) || 0,
+    };
   }
-  res.json({ ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()), symbols });
+  const dynamic = subs.filter(s => !subMeta[s].core).length;
+  res.json({
+    ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
+    subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
+    symbols,
+  });
 });
 
 app.get('/gex', auth, (req, res) => {
   const sym = String(req.query.symbol || 'SPX').toUpperCase();
+  ensureSub(sym);
   res.set('Cache-Control', 'no-store');
   res.json(assembleGrid(sym, req.query.exps));
 });
 
 app.get('/seed', auth, (req, res) => {
   const sym = String(req.query.symbol || 'SPX').toUpperCase();
+  ensureSub(sym);
   res.set('Cache-Control', 'no-store');
   res.json({ symbol: sym, history: momHist[sym] || [] });
 });
@@ -227,6 +248,7 @@ app.get('/seed', auth, (req, res) => {
 app.get('/stream', auth, (req, res) => {
   const sym  = String(req.query.symbol || 'SPX').toUpperCase();
   const exps = req.query.exps ? String(req.query.exps) : '';
+  ensureSub(sym);
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-store',
@@ -282,19 +304,64 @@ socket.onError((e) => { socketStatus = 'error'; console.error('[socket] error', 
 socket.onClose(() => { socketStatus = 'closed'; console.warn('[socket] closed'); });
 socket.connect();
 
-for (const sym of SYMBOLS) {
+// ---- subscription manager (core + on-demand) -------------------------------
+const channels = {};   // sym -> Phoenix channel
+const subMeta  = {};   // sym -> { core, lastReq }
+
+function joinSym(sym, core) {
+  if (channels[sym]) { if (core && subMeta[sym]) subMeta[sym].core = true; return; }
+  if (!core) {
+    const dyn = Object.keys(subMeta).filter(s => !subMeta[s].core).length;
+    if (dyn >= MAX_DYNAMIC) evictLRU();        // make room for the new one
+  }
   const topic = `gex_strike_expiry:${sym}`;
   const ch = socket.channel(topic, {});
   // Catch EVERY event on the channel (robust to the exact push event name);
   // ingest anything that looks like a strike row.
-  ch.onMessage = (event, payload, ref) => {
-    if (payload && payload.strike != null) ingest(sym, payload);
-    return payload;   // Phoenix requires onMessage to return the payload
-  };
+  ch.onMessage = (event, payload) => { if (payload && payload.strike != null) ingest(sym, payload); return payload; };
   ch.join()
-    .receive('ok',      () => console.log('[join ok]', topic))
+    .receive('ok',      () => console.log('[join ok]', topic, core ? '(core)' : '(on-demand)'))
     .receive('error',   (r) => console.error('[join error]', topic, r))
     .receive('timeout', () => console.error('[join timeout]', topic));
+  channels[sym] = ch;
+  subMeta[sym]  = { core: !!core, lastReq: Date.now() };
 }
 
-app.listen(PORT, () => console.log(`[http] listening on :${PORT} — symbols: ${SYMBOLS.join(', ')}`));
+// Mark a symbol as wanted now; subscribe if we aren't already.
+function ensureSub(sym) {
+  if (!sym) return;
+  if (subMeta[sym]) subMeta[sym].lastReq = Date.now();
+  else joinSym(sym, false);
+}
+
+function dropSym(sym) {
+  const ch = channels[sym];
+  if (ch) { try { ch.leave(); } catch {} }
+  delete channels[sym]; delete subMeta[sym]; delete state[sym]; delete momHist[sym];
+}
+
+// Evict the least-recently-requested on-demand sub that has no active SSE viewers.
+function evictLRU() {
+  let victim = null, oldest = Infinity;
+  for (const s of Object.keys(subMeta)) {
+    if (subMeta[s].core) continue;
+    if (sse[s] && sse[s].size) continue;       // someone's streaming it — keep
+    if (subMeta[s].lastReq < oldest) { oldest = subMeta[s].lastReq; victim = s; }
+  }
+  if (victim) { console.log('[evict]', victim); dropSym(victim); }
+}
+
+// Idle sweep: drop on-demand subs no one has touched in IDLE_TTL_MS (and no viewers).
+setInterval(() => {
+  const now = Date.now();
+  for (const s of Object.keys(subMeta)) {
+    if (subMeta[s].core) continue;
+    if (sse[s] && sse[s].size) continue;
+    if (now - subMeta[s].lastReq > IDLE_TTL_MS) { console.log('[idle drop]', s); dropSym(s); }
+  }
+}, 60000);
+
+// boot: warm the core set
+for (const sym of CORE) joinSym(sym, true);
+
+app.listen(PORT, () => console.log(`[http] listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
