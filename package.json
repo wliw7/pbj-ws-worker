@@ -1,0 +1,19 @@
+{
+  "name": "pbj-gex-ws-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PBJ Capital — single UW WebSocket consumer that fans out the live GEX grid to many dashboard users (decouples UW API load from user count).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "phoenix": "^1.7.14",
+    "ws": "^8.18.0"
+  }
+}
