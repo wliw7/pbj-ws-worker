@@ -41,10 +41,9 @@ const crypto  = require('crypto');
 const express = require('express');
 const cors    = require('cors');
 const WebSocket = require('ws');
-const { Socket } = require('phoenix');
 
 // ---- config ----------------------------------------------------------------
-const UW_KEY         = process.env.UW_KEY;
+const UW_KEY         = (process.env.UW_KEY || '').trim();   // trim: kill any stray whitespace/newline from the env paste
 const PORT           = parseInt(process.env.PORT || '8080', 10);
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
@@ -291,40 +290,43 @@ setInterval(() => {
   }
 }, HIST_STEP_MS);
 
-// ---- UW WebSocket (Phoenix channels) ---------------------------------------
-let socketStatus = 'connecting';
-const socket = new Socket('wss://api.unusualwhales.com/socket', {
-  params: { token: UW_KEY },
-  transport: WebSocket,
-  heartbeatIntervalMs: 30000,
-  reconnectAfterMs: (tries) => [1000, 2000, 5000, 10000][tries - 1] || 10000,
-});
-socket.onOpen(()  => { socketStatus = 'open';   console.log('[socket] open'); });
-socket.onError((e) => { socketStatus = 'error'; console.error('[socket] error', (e && e.message) || e); });
-socket.onClose(() => { socketStatus = 'closed'; console.warn('[socket] closed'); });
-socket.connect();
+// ---- UW WebSocket (raw ws; Phoenix wire protocol at /socket) ----------------
+// UW serves the socket at /socket directly (NOT the Phoenix-default /socket/websocket),
+// so we connect with a raw ws client and speak the Phoenix v2 frames ourselves:
+//   join      -> [join_ref, ref, "gex_strike_expiry:SPX", "phx_join", {}]
+//   heartbeat -> [null, ref, "phoenix", "heartbeat", {}]
+//   data in   -> [join_ref, ref, topic, event, payload]   (payload = a strike row)
+const WS_URL = `wss://api.unusualwhales.com/socket?token=${UW_KEY}&vsn=2.0.0`;   // raw token, exactly like the wscat test that connected
 
-// ---- subscription manager (core + on-demand) -------------------------------
-const channels = {};   // sym -> Phoenix channel
-const subMeta  = {};   // sym -> { core, lastReq }
+let socketStatus = 'connecting';
+let ws = null, wsReady = false, hbTimer = null, reconnectTimer = null, reconnectTries = 0, rawLogged = 0;
+let refCtr = 0; const nextRef = () => String(++refCtr);
+
+const channels   = {};   // sym -> { topic, joinRef }
+const subMeta    = {};   // sym -> { core, lastReq }
+const topicToSym = {};   // topic -> sym
+
+function wsSend(arr) {
+  if (ws && ws.readyState === 1) { try { ws.send(JSON.stringify(arr)); } catch (e) { console.error('[ws send]', e.message); } }
+}
+
+function joinChannel(sym) {
+  const c = channels[sym]; if (!c) return;
+  c.joinRef = nextRef();
+  topicToSym[c.topic] = sym;
+  wsSend([c.joinRef, c.joinRef, c.topic, 'phx_join', {}]);
+  console.log('[join \u2192]', c.topic);
+}
 
 function joinSym(sym, core) {
-  if (channels[sym]) { if (core && subMeta[sym]) subMeta[sym].core = true; return; }
+  if (channels[sym]) { if (core) subMeta[sym].core = true; return; }
   if (!core) {
     const dyn = Object.keys(subMeta).filter(s => !subMeta[s].core).length;
-    if (dyn >= MAX_DYNAMIC) evictLRU();        // make room for the new one
+    if (dyn >= MAX_DYNAMIC) evictLRU();
   }
-  const topic = `gex_strike_expiry:${sym}`;
-  const ch = socket.channel(topic, {});
-  // Catch EVERY event on the channel (robust to the exact push event name);
-  // ingest anything that looks like a strike row.
-  ch.onMessage = (event, payload) => { if (payload && payload.strike != null) ingest(sym, payload); return payload; };
-  ch.join()
-    .receive('ok',      () => console.log('[join ok]', topic, core ? '(core)' : '(on-demand)'))
-    .receive('error',   (r) => console.error('[join error]', topic, r))
-    .receive('timeout', () => console.error('[join timeout]', topic));
-  channels[sym] = ch;
+  channels[sym] = { topic: `gex_strike_expiry:${sym}`, joinRef: null };
   subMeta[sym]  = { core: !!core, lastReq: Date.now() };
+  if (wsReady) joinChannel(sym);            // socket up -> join now; else joined on (re)connect
 }
 
 // Mark a symbol as wanted now; subscribe if we aren't already.
@@ -335,8 +337,8 @@ function ensureSub(sym) {
 }
 
 function dropSym(sym) {
-  const ch = channels[sym];
-  if (ch) { try { ch.leave(); } catch {} }
+  const c = channels[sym];
+  if (c) { if (wsReady) wsSend([c.joinRef, nextRef(), c.topic, 'phx_leave', {}]); delete topicToSym[c.topic]; }
   delete channels[sym]; delete subMeta[sym]; delete state[sym]; delete momHist[sym];
 }
 
@@ -361,7 +363,56 @@ setInterval(() => {
   }
 }, 60000);
 
-// boot: warm the core set
-for (const sym of CORE) joinSym(sym, true);
+// Parse an incoming frame and ingest strike rows. Tolerant of the 5-element
+// Phoenix array, a simplified [topic, payload], or an object form.
+function handleFrame(m) {
+  let topic, event, payload;
+  if (Array.isArray(m)) {
+    if (m.length === 5)      { topic = m[2]; event = m[3]; payload = m[4]; }
+    else if (m.length === 2) { topic = m[0]; payload = m[1]; event = 'msg'; }
+    else return;
+  } else if (m && typeof m === 'object') { topic = m.topic; event = m.event; payload = m.payload; }
+  else return;
+  if (event === 'phx_reply') {
+    if (payload && payload.status && payload.status !== 'ok') console.error('[join reply]', topic, JSON.stringify(payload).slice(0, 200));
+    return;
+  }
+  if (event === 'phx_error' || event === 'phx_close' || topic === 'phoenix') return;
+  if (!payload || payload.strike == null) return;
+  const sym = topicToSym[topic] || (payload.ticker ? String(payload.ticker).toUpperCase() : null);
+  if (sym) ingest(sym, payload);
+}
 
-app.listen(PORT, () => console.log(`[http] listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
+function connect() {
+  socketStatus = 'connecting'; wsReady = false;
+  console.log('[connect] \u2192', WS_URL.replace(/token=[^&]*/, 'token=***'), '| key len', UW_KEY.length);
+  ws = new WebSocket(WS_URL);
+  ws.on('open', () => {
+    socketStatus = 'open'; wsReady = true; reconnectTries = 0;
+    console.log('[socket] open');
+    for (const sym of Object.keys(channels)) joinChannel(sym);   // (re)join everything we track
+    if (hbTimer) clearInterval(hbTimer);
+    hbTimer = setInterval(() => wsSend([null, nextRef(), 'phoenix', 'heartbeat', {}]), 30000);
+  });
+  ws.on('message', (buf) => {
+    let m; try { m = JSON.parse(buf.toString()); } catch { return; }
+    if (rawLogged < 3) { rawLogged++; console.log('[raw msg]', JSON.stringify(m).slice(0, 300)); }
+    handleFrame(m);
+  });
+  ws.on('error', (e) => { socketStatus = 'error'; console.error('[socket] error', (e && e.message) || e); });
+  ws.on('close', (code, reason) => {
+    socketStatus = 'closed'; wsReady = false;
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    console.warn('[socket] closed', code || '', reason ? reason.toString().slice(0, 120) : '');
+    if (!reconnectTimer) {
+      const delay = [1000, 2000, 5000, 10000][reconnectTries++] || 10000;
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+    }
+  });
+}
+
+// boot: register the core set, then connect (channels join on 'open')
+for (const sym of CORE) joinSym(sym, true);
+connect();
+
+app.listen(PORT, () => console.log(`[http] rev rawws-3 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
