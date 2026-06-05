@@ -290,12 +290,13 @@ setInterval(() => {
   }
 }, HIST_STEP_MS);
 
-// ---- UW WebSocket (raw ws; Phoenix wire protocol at /socket) ----------------
-// UW serves the socket at /socket directly (NOT the Phoenix-default /socket/websocket),
-// so we connect with a raw ws client and speak the Phoenix v2 frames ourselves:
-//   join      -> [join_ref, ref, "gex_strike_expiry:SPX", "phx_join", {}]
-//   heartbeat -> [null, ref, "phoenix", "heartbeat", {}]
-//   data in   -> [join_ref, ref, topic, event, payload]   (payload = a strike row)
+// ---- UW WebSocket (raw ws; UW's own JSON protocol at /socket) ---------------
+// UW is NOT standard Phoenix wire protocol. Per the official docs you connect to
+// /socket?token=... then join a channel by sending a simple JSON object:
+//   join   -> {"channel":"gex_strike_expiry:SPX","msg_type":"join"}
+//   reply  -> ["gex_strike_expiry:SPX", {"response":{}, "status":"ok"}]
+//   data   -> ["gex_strike_expiry:SPX", { ...strike row... }]   (during market hours)
+// Keepalive is a plain WS ping; no app-level heartbeat frame is required.
 const WS_URL = `wss://api.unusualwhales.com/socket?token=${UW_KEY}&vsn=2.0.0`;   // raw token, exactly like the wscat test that connected
 
 let socketStatus = 'connecting';
@@ -312,9 +313,8 @@ function wsSend(arr) {
 
 function joinChannel(sym) {
   const c = channels[sym]; if (!c) return;
-  c.joinRef = nextRef();
   topicToSym[c.topic] = sym;
-  wsSend([c.joinRef, c.joinRef, c.topic, 'phx_join', {}]);
+  wsSend({ channel: c.topic, msg_type: 'join' });
   console.log('[join \u2192]', c.topic);
 }
 
@@ -338,7 +338,7 @@ function ensureSub(sym) {
 
 function dropSym(sym) {
   const c = channels[sym];
-  if (c) { if (wsReady) wsSend([c.joinRef, nextRef(), c.topic, 'phx_leave', {}]); delete topicToSym[c.topic]; }
+  if (c) { if (wsReady) wsSend({ channel: c.topic, msg_type: 'leave' }); delete topicToSym[c.topic]; }
   delete channels[sym]; delete subMeta[sym]; delete state[sym]; delete momHist[sym];
 }
 
@@ -366,21 +366,21 @@ setInterval(() => {
 // Parse an incoming frame and ingest strike rows. Tolerant of the 5-element
 // Phoenix array, a simplified [topic, payload], or an object form.
 function handleFrame(m) {
-  let topic, event, payload;
-  if (Array.isArray(m)) {
-    if (m.length === 5)      { topic = m[2]; event = m[3]; payload = m[4]; }
-    else if (m.length === 2) { topic = m[0]; payload = m[1]; event = 'msg'; }
-    else return;
-  } else if (m && typeof m === 'object') { topic = m.topic; event = m.event; payload = m.payload; }
+  // UW frames are ["<channel>", <payload>]. A join/leave reply payload carries
+  // {status,response}; a data row carries {strike, expiry, price, ...}.
+  let topic, payload;
+  if (Array.isArray(m) && m.length >= 2)            { topic = m[0]; payload = m[1]; }
+  else if (m && typeof m === 'object' && m.channel) { topic = m.channel; payload = m.data || m.payload; }
   else return;
-  if (event === 'phx_reply') {
-    if (payload && payload.status && payload.status !== 'ok') console.error('[join reply]', topic, JSON.stringify(payload).slice(0, 200));
+  if (!payload || typeof payload !== 'object') return;
+  if (payload.status !== undefined && payload.strike === undefined) {   // join / leave ack
+    if (payload.status !== 'ok') console.error('[join ERR]', topic, JSON.stringify(payload).slice(0, 160));
+    else                         console.log('[join ok]', topic);
     return;
   }
-  if (event === 'phx_error' || event === 'phx_close' || topic === 'phoenix') return;
-  if (!payload || payload.strike == null) return;
+  if (payload.strike == null) return;
   const sym = topicToSym[topic] || (payload.ticker ? String(payload.ticker).toUpperCase() : null);
-  if (sym) ingest(sym, payload);
+  if (sym && channels[sym]) ingest(sym, payload);   // only ingest channels we still track
 }
 
 function connect() {
@@ -392,7 +392,7 @@ function connect() {
     console.log('[socket] open');
     for (const sym of Object.keys(channels)) joinChannel(sym);   // (re)join everything we track
     if (hbTimer) clearInterval(hbTimer);
-    hbTimer = setInterval(() => wsSend([null, nextRef(), 'phoenix', 'heartbeat', {}]), 30000);
+    hbTimer = setInterval(() => { try { ws.ping(); } catch {} }, 30000);   // WS-level keepalive
   });
   ws.on('message', (buf) => {
     let m; try { m = JSON.parse(buf.toString()); } catch { return; }
@@ -415,4 +415,4 @@ function connect() {
 for (const sym of CORE) joinSym(sym, true);
 connect();
 
-app.listen(PORT, () => console.log(`[http] rev rawws-3 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
+app.listen(PORT, () => console.log(`[http] rev uw-proto-1 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
