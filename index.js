@@ -216,6 +216,7 @@ app.get('/health', (_req, res) => {
     const st = state[sym];
     symbols[sym] = {
       core: !!subMeta[sym].core,
+      joined: !!(channels[sym] && channels[sym].joined),
       cells: st ? st.cells.size : 0,
       spot: st ? st.spot : 0,
       lastMsgAgeMs: (st && st.lastMsg) ? now - st.lastMsg : null,
@@ -223,8 +224,11 @@ app.get('/health', (_req, res) => {
     };
   }
   const dynamic = subs.filter(s => !subMeta[s].core).length;
+  const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
+    rev: 'uw-proto-2',
+    joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     symbols,
   });
@@ -324,7 +328,7 @@ function joinSym(sym, core) {
     const dyn = Object.keys(subMeta).filter(s => !subMeta[s].core).length;
     if (dyn >= MAX_DYNAMIC) evictLRU();
   }
-  channels[sym] = { topic: `gex_strike_expiry:${sym}`, joinRef: null };
+  channels[sym] = { topic: `gex_strike_expiry:${sym}`, joined: false };
   subMeta[sym]  = { core: !!core, lastReq: Date.now() };
   if (wsReady) joinChannel(sym);            // socket up -> join now; else joined on (re)connect
 }
@@ -374,8 +378,9 @@ function handleFrame(m) {
   else return;
   if (!payload || typeof payload !== 'object') return;
   if (payload.status !== undefined && payload.strike === undefined) {   // join / leave ack
+    const jsym = topicToSym[topic];
     if (payload.status !== 'ok') console.error('[join ERR]', topic, JSON.stringify(payload).slice(0, 160));
-    else                         console.log('[join ok]', topic);
+    else { if (jsym && channels[jsym]) channels[jsym].joined = true; console.log('[join ok]', topic); }
     return;
   }
   if (payload.strike == null) return;
@@ -402,6 +407,7 @@ function connect() {
   ws.on('error', (e) => { socketStatus = 'error'; console.error('[socket] error', (e && e.message) || e); });
   ws.on('close', (code, reason) => {
     socketStatus = 'closed'; wsReady = false;
+    for (const s in channels) channels[s].joined = false;   // re-join + re-ack on reconnect
     if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
     console.warn('[socket] closed', code || '', reason ? reason.toString().slice(0, 120) : '');
     if (!reconnectTimer) {
@@ -415,4 +421,4 @@ function connect() {
 for (const sym of CORE) joinSym(sym, true);
 connect();
 
-app.listen(PORT, () => console.log(`[http] rev uw-proto-1 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
+app.listen(PORT, () => console.log(`[http] rev uw-proto-2 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
