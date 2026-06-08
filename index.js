@@ -304,10 +304,14 @@ setInterval(() => {
 // ============================================================================
 const TRADES_KEEP = parseInt(process.env.TRADES_KEEP || '180', 10);   // prints retained per symbol
 const ALERTS_KEEP = parseInt(process.env.ALERTS_KEEP || '150', 10);   // alerts retained (global ring)
-// UW documents these socket channels: option_trades, option_trades:<T>, flow-alerts,
-// gex, gex_strike_expiry, price, news. Dark pool is NOT a confirmed socket channel —
-// set DARKPOOL_CHANNEL to the exact name once you confirm it and it gets relayed too.
-const DARKPOOL_CHANNEL = (process.env.DARKPOOL_CHANNEL || '').trim();
+// UW socket channels (confirmed via /api/socket): option_trades, option_trades:<T>,
+// flow-alerts, price:<T>, news, lit_trades, off_lit_trades, gex, gex_strike,
+// gex_strike_expiry, market_tide, net_flow, interval_flow, contract_screener,
+// trading_halts, custom_alerts. Dark pool = off_lit_trades (off-lit/TRF prints).
+const DARKPOOL_CHANNEL = (process.env.DARKPOOL_CHANNEL || 'off_lit_trades').trim();   // '' to disable
+// off_lit_trades is the FULL dark-pool firehose (every print) — relay only notable
+// blocks so the tape shows institutional size, not noise. notional = price × shares.
+const DARKPOOL_MIN_NOTIONAL = parseFloat(process.env.DARKPOOL_MIN_NOTIONAL || '1000000');
 
 const tradesBuf   = {};   // sym -> [print,…] newest last
 const tradeSubs   = {};   // sym -> Set(res)
@@ -315,6 +319,7 @@ const tradeMeta   = {};   // sym -> { lastReq }
 const tradeTopics = {};   // 'option_trades:SYM' -> SYM
 const alertsBuf   = [];   // [{source,…alert}] global ring
 const alertSubs   = new Set();
+let   alertsJoined = false;   // flow-alerts + dark pool joined only while someone views /alerts
 
 const tradeTopic = (sym) => `option_trades:${sym}`;
 function ensureTrades(sym) {
@@ -362,6 +367,27 @@ function onAlert(source, p) {
   alertsBuf.push(row); if (alertsBuf.length > ALERTS_KEEP) alertsBuf.shift();
   if (alertSubs.size) { const data = `data: ${JSON.stringify(row)}\n\n`; for (const res of alertSubs) { try { res.write(data); } catch {} } }
 }
+// off_lit_trades is the full dark-pool tape — keep only notable blocks, shape compact
+function onDarkpool(p) {
+  const price = num(p.price), size = num(p.size), notional = price * size;
+  if (!(notional >= DARKPOOL_MIN_NOTIONAL)) return;
+  onAlert('darkpool', {
+    ticker: p.symbol, price, size, notional, volume: num(p.volume),
+    bid: num(p.nbbo_bid), ask: num(p.nbbo_ask), sector: p.sector || '',
+    executed_at: p.trf_executed_at || p.executed_at,
+  });
+}
+// flow-alerts + dark pool are global firehoses — join only while someone views /alerts
+function ensureAlerts() {
+  if (alertsJoined) return; alertsJoined = true;
+  if (wsReady) { wsSend({ channel: 'flow-alerts', msg_type: 'join' }); if (DARKPOOL_CHANNEL) wsSend({ channel: DARKPOOL_CHANNEL, msg_type: 'join' }); }
+  console.log('[alerts join \u2192] flow-alerts' + (DARKPOOL_CHANNEL ? ' + ' + DARKPOOL_CHANNEL : ''));
+}
+function dropAlerts() {
+  if (!alertsJoined || alertSubs.size) return; alertsJoined = false;
+  if (wsReady) { wsSend({ channel: 'flow-alerts', msg_type: 'leave' }); if (DARKPOOL_CHANNEL) wsSend({ channel: DARKPOOL_CHANNEL, msg_type: 'leave' }); }
+  console.log('[alerts leave] no viewers');
+}
 
 // SSE: live prints for one symbol (rich/cheap tab)
 app.get('/trades', auth, (req, res) => {
@@ -376,15 +402,16 @@ app.get('/trades', auth, (req, res) => {
   req.on('close', () => { clearInterval(ping); const s = tradeSubs[sym]; if (s) s.delete(res); });
 });
 
-// SSE: global alert tape — unusual activity (flow-alerts) + dark pool (if enabled)
+// SSE: global alert tape — unusual activity (flow-alerts) + dark pool (off_lit_trades)
 app.get('/alerts', auth, (req, res) => {
+  ensureAlerts();
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.flushHeaders && res.flushHeaders();
   res.write(`retry: 3000\n\n`);
   for (const row of alertsBuf.slice(-60)) res.write(`data: ${JSON.stringify(row)}\n\n`);
   alertSubs.add(res);
   const ping = setInterval(() => { try { res.write(`: ping\n\n`); } catch {} }, 25000);
-  req.on('close', () => { clearInterval(ping); alertSubs.delete(res); });
+  req.on('close', () => { clearInterval(ping); alertSubs.delete(res); setTimeout(dropAlerts, 5000); });
 });
 
 // idle sweep for on-demand trade subs (mirrors the gex idle policy)
@@ -488,7 +515,7 @@ function handleFrame(m) {
   // edge tab: route non-GEX channels before the gex-cell ingest
   if (typeof topic === 'string') {
     if (topic === 'flow-alerts' || topic.indexOf('flow-alerts') === 0) { onAlert('flow', payload); return; }
-    if (DARKPOOL_CHANNEL && (topic === DARKPOOL_CHANNEL || topic.indexOf(DARKPOOL_CHANNEL) === 0)) { onAlert('darkpool', payload); return; }
+    if (DARKPOOL_CHANNEL && (topic === DARKPOOL_CHANNEL || topic.indexOf(DARKPOOL_CHANNEL) === 0)) { onDarkpool(payload); return; }
     if (topic.indexOf('option_trades') === 0) { onTrade(topic, payload); return; }
   }
   if (payload.strike == null) return;
@@ -505,8 +532,10 @@ function connect() {
     console.log('[socket] open');
     for (const sym of Object.keys(channels)) joinChannel(sym);   // (re)join everything we track
     for (const topic of Object.keys(tradeTopics)) wsSend({ channel: topic, msg_type: 'join' });   // (re)join trade subs
-    wsSend({ channel: 'flow-alerts', msg_type: 'join' });                                          // unusual activity (global)
-    if (DARKPOOL_CHANNEL) wsSend({ channel: DARKPOOL_CHANNEL, msg_type: 'join' });                 // dark pool (global, if set)
+    if (alertsJoined) {                                                                            // re-join alert firehoses only if a viewer is connected
+      wsSend({ channel: 'flow-alerts', msg_type: 'join' });
+      if (DARKPOOL_CHANNEL) wsSend({ channel: DARKPOOL_CHANNEL, msg_type: 'join' });
+    }
     if (hbTimer) clearInterval(hbTimer);
     hbTimer = setInterval(() => { try { ws.ping(); } catch {} }, 30000);   // WS-level keepalive
   });
