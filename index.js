@@ -294,6 +294,108 @@ setInterval(() => {
   }
 }, HIST_STEP_MS);
 
+// ============================================================================
+// EDGE — live option_trades (rich/cheap detector) + alert tape
+// (unusual activity = flow-alerts ; dark pool = parameterized). Same UW socket,
+// same pbj_session gate, fanned out over SSE. No extra REST, no polling.
+//   GET /trades?symbol=SPX&s=<ticket>  — SSE; per-print stream for one symbol
+//   GET /alerts?s=<ticket>             — SSE; global tape: flow-alerts (+ dark pool)
+// The browser does the Black-Scholes / rich-cheap math; we just relay the fields.
+// ============================================================================
+const TRADES_KEEP = parseInt(process.env.TRADES_KEEP || '180', 10);   // prints retained per symbol
+const ALERTS_KEEP = parseInt(process.env.ALERTS_KEEP || '150', 10);   // alerts retained (global ring)
+// UW documents these socket channels: option_trades, option_trades:<T>, flow-alerts,
+// gex, gex_strike_expiry, price, news. Dark pool is NOT a confirmed socket channel —
+// set DARKPOOL_CHANNEL to the exact name once you confirm it and it gets relayed too.
+const DARKPOOL_CHANNEL = (process.env.DARKPOOL_CHANNEL || '').trim();
+
+const tradesBuf   = {};   // sym -> [print,…] newest last
+const tradeSubs   = {};   // sym -> Set(res)
+const tradeMeta   = {};   // sym -> { lastReq }
+const tradeTopics = {};   // 'option_trades:SYM' -> SYM
+const alertsBuf   = [];   // [{source,…alert}] global ring
+const alertSubs   = new Set();
+
+const tradeTopic = (sym) => `option_trades:${sym}`;
+function ensureTrades(sym) {
+  if (!sym) return; sym = sym.toUpperCase();
+  if (tradeMeta[sym]) { tradeMeta[sym].lastReq = Date.now(); return; }
+  tradeMeta[sym] = { lastReq: Date.now() };
+  const topic = tradeTopic(sym); tradeTopics[topic] = sym;
+  if (wsReady) wsSend({ channel: topic, msg_type: 'join' });
+  console.log('[trades join \u2192]', topic);
+}
+function dropTrades(sym) {
+  const topic = tradeTopic(sym);
+  if (wsReady) wsSend({ channel: topic, msg_type: 'leave' });
+  delete tradeTopics[topic]; delete tradeMeta[sym]; delete tradesBuf[sym];
+}
+// relay only the fields the tab needs; the rich/cheap + BS math runs client-side
+function shapeTrade(sym, p) {
+  const tags  = Array.isArray(p.tags) ? p.tags : [];
+  const flags = Array.isArray(p.report_flags) ? p.report_flags : [];
+  return {
+    id: p.id, t: p.executed_at || p.created_at || Date.now(), sym,
+    opt: p.option_symbol, type: String(p.option_type || '').charAt(0).toUpperCase(),
+    strike: num(p.strike), expiry: p.expiry,
+    price: num(p.price), size: num(p.size), premium: num(p.premium),
+    spot: num(p.underlying_price), bid: num(p.nbbo_bid), ask: num(p.nbbo_ask),
+    theo: num(p.theo), uwiv: num(p.implied_volatility),
+    oi: num(p.open_interest), vol: num(p.volume), exch: p.exchange || '',
+    side: tags.find(t => t === 'ask_side' || t === 'bid_side' || t === 'mid_side' || t === 'no_side') || '',
+    dir:  tags.find(t => t === 'bullish' || t === 'bearish') || '',
+    sweep: flags.includes('sweep') || tags.includes('sweep'),
+  };
+}
+function onTrade(topic, p) {
+  const sym = tradeTopics[topic] || (p.underlying_symbol ? String(p.underlying_symbol).toUpperCase() : null);
+  if (!sym) return;
+  if (tradeMeta[sym]) tradeMeta[sym].lastReq = Date.now();
+  const row = shapeTrade(sym, p);
+  const buf = tradesBuf[sym] || (tradesBuf[sym] = []);
+  buf.push(row); if (buf.length > TRADES_KEEP) buf.shift();
+  const subs = tradeSubs[sym];
+  if (subs && subs.size) { const data = `data: ${JSON.stringify(row)}\n\n`; for (const res of subs) { try { res.write(data); } catch {} } }
+}
+function onAlert(source, p) {
+  const row = Object.assign({ source, t: Date.now() }, p);
+  alertsBuf.push(row); if (alertsBuf.length > ALERTS_KEEP) alertsBuf.shift();
+  if (alertSubs.size) { const data = `data: ${JSON.stringify(row)}\n\n`; for (const res of alertSubs) { try { res.write(data); } catch {} } }
+}
+
+// SSE: live prints for one symbol (rich/cheap tab)
+app.get('/trades', auth, (req, res) => {
+  const sym = String(req.query.symbol || 'SPX').toUpperCase();
+  ensureTrades(sym);
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders && res.flushHeaders();
+  res.write(`retry: 3000\n\n`);
+  for (const row of (tradesBuf[sym] || []).slice(-60)) res.write(`data: ${JSON.stringify(row)}\n\n`);   // backlog → instant paint
+  (tradeSubs[sym] || (tradeSubs[sym] = new Set())).add(res);
+  const ping = setInterval(() => { try { res.write(`: ping\n\n`); } catch {} }, 25000);
+  req.on('close', () => { clearInterval(ping); const s = tradeSubs[sym]; if (s) s.delete(res); });
+});
+
+// SSE: global alert tape — unusual activity (flow-alerts) + dark pool (if enabled)
+app.get('/alerts', auth, (req, res) => {
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders && res.flushHeaders();
+  res.write(`retry: 3000\n\n`);
+  for (const row of alertsBuf.slice(-60)) res.write(`data: ${JSON.stringify(row)}\n\n`);
+  alertSubs.add(res);
+  const ping = setInterval(() => { try { res.write(`: ping\n\n`); } catch {} }, 25000);
+  req.on('close', () => { clearInterval(ping); alertSubs.delete(res); });
+});
+
+// idle sweep for on-demand trade subs (mirrors the gex idle policy)
+setInterval(() => {
+  const now = Date.now();
+  for (const sym of Object.keys(tradeMeta)) {
+    if (tradeSubs[sym] && tradeSubs[sym].size) continue;
+    if (now - tradeMeta[sym].lastReq > IDLE_TTL_MS) { console.log('[trades idle drop]', sym); dropTrades(sym); }
+  }
+}, 60000);
+
 // ---- UW WebSocket (raw ws; UW's own JSON protocol at /socket) ---------------
 // UW is NOT standard Phoenix wire protocol. Per the official docs you connect to
 // /socket?token=... then join a channel by sending a simple JSON object:
@@ -383,6 +485,12 @@ function handleFrame(m) {
     else { if (jsym && channels[jsym]) channels[jsym].joined = true; console.log('[join ok]', topic); }
     return;
   }
+  // edge tab: route non-GEX channels before the gex-cell ingest
+  if (typeof topic === 'string') {
+    if (topic === 'flow-alerts' || topic.indexOf('flow-alerts') === 0) { onAlert('flow', payload); return; }
+    if (DARKPOOL_CHANNEL && (topic === DARKPOOL_CHANNEL || topic.indexOf(DARKPOOL_CHANNEL) === 0)) { onAlert('darkpool', payload); return; }
+    if (topic.indexOf('option_trades') === 0) { onTrade(topic, payload); return; }
+  }
   if (payload.strike == null) return;
   const sym = topicToSym[topic] || (payload.ticker ? String(payload.ticker).toUpperCase() : null);
   if (sym && channels[sym]) ingest(sym, payload);   // only ingest channels we still track
@@ -396,6 +504,9 @@ function connect() {
     socketStatus = 'open'; wsReady = true; reconnectTries = 0;
     console.log('[socket] open');
     for (const sym of Object.keys(channels)) joinChannel(sym);   // (re)join everything we track
+    for (const topic of Object.keys(tradeTopics)) wsSend({ channel: topic, msg_type: 'join' });   // (re)join trade subs
+    wsSend({ channel: 'flow-alerts', msg_type: 'join' });                                          // unusual activity (global)
+    if (DARKPOOL_CHANNEL) wsSend({ channel: DARKPOOL_CHANNEL, msg_type: 'join' });                 // dark pool (global, if set)
     if (hbTimer) clearInterval(hbTimer);
     hbTimer = setInterval(() => { try { ws.ping(); } catch {} }, 30000);   // WS-level keepalive
   });
