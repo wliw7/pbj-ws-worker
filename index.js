@@ -78,7 +78,7 @@ const momHist = {};   // sym -> [{ t, gex: { "strike|expiry": flow } }]   (match
 function ingest(sym, d) {
   if (!d || d.strike == null || !d.expiry) return;
   const st = S(sym);
-  const price = num(d.price); if (price > 0) { st.spot = price; pushSpot(sym); }   // fast spot push — beat the 1s grid flush
+  const price = num(d.price); if (price > 0) { st.spot = price; pushSpot(sym); }   // fast spot push (beats the 1s grid flush)
   st.ts = d.timestamp || Date.now();
   st.lastMsg = Date.now();
   const flow =
@@ -282,11 +282,11 @@ setInterval(() => {
 }, SSE_FLUSH_MS);
 
 // ---- fast spot push --------------------------------------------------------
-// The heavy grid flushes ~1/sec; that throttle + the gamma cadence is the "spot
-// delay" users feel. So push a TINY spot-only SSE event (a named `spot` event)
-// the moment the price changes — independent of the grid. Debounced so a busy
-// symbol can't exceed ~SPOT_MIN_MS. The grid (and gex math) is unchanged.
-const SPOT_MIN_MS = 150;        // ≤ ~6–7 spot ticks/sec per symbol
+// The heavy grid flushes ~1/sec; that throttle + the gamma cadence is the spot
+// delay users feel. So push a TINY spot-only SSE event (named `spot`) the moment
+// the price changes -- independent of the grid. Debounced so a busy symbol can't
+// exceed ~SPOT_MIN_MS. The grid (and gex math) is unchanged.
+const SPOT_MIN_MS = 150;        // up to ~6-7 spot ticks/sec per symbol
 const spotPush = {};            // sym -> { last, timer }
 function pushSpot(sym) {
   const subs = sse[sym]; if (!subs || !subs.size) return;
@@ -469,11 +469,8 @@ function joinChannel(sym) {
   const c = channels[sym]; if (!c) return;
   topicToSym[c.topic] = sym;
   wsSend({ channel: c.topic, msg_type: 'join' });
-  if (c.priceTopic) {                              // dedicated price-tick feed (index symbols)
-    topicToSym[c.priceTopic] = sym;
-    wsSend({ channel: c.priceTopic, msg_type: 'join' });
-  }
-  console.log('[join \u2192]', c.topic, c.priceTopic ? '+ ' + c.priceTopic : '');
+  if (c.priceTopic) { topicToSym[c.priceTopic] = sym; wsSend({ channel: c.priceTopic, msg_type: 'join' }); }
+  console.log('[join \u2192]', c.topic);
 }
 
 function joinSym(sym, core) {
@@ -482,10 +479,10 @@ function joinSym(sym, core) {
     const dyn = Object.keys(subMeta).filter(s => !subMeta[s].core).length;
     if (dyn >= MAX_DYNAMIC) evictLRU();
   }
-  // Index symbols also subscribe the dedicated price-tick channel (lower latency than
-  // the gamma-piggybacked price). If UW gates it, the join just errors and we fall back
-  // to the gamma price — no regression. Stocks rely on their frequent gamma prints.
-  channels[sym] = { topic: `gex_strike_expiry:${sym}`, priceTopic: INDEX_LIKE.has(sym) ? `price:${sym}` : null, joined: false };
+  // SPX-only: also subscribe UW's dedicated price-tick channel (price:SPX) for a faster,
+  // cleaner spot than the gamma-piggybacked price. If UW gates it, the join just errors and
+  // we fall back to the gamma price -- no regression. Easy to widen later.
+  channels[sym] = { topic: `gex_strike_expiry:${sym}`, priceTopic: (sym === 'SPX') ? `price:${sym}` : null, joined: false };
   subMeta[sym]  = { core: !!core, lastReq: Date.now() };
   if (wsReady) joinChannel(sym);            // socket up -> join now; else joined on (re)connect
 }
@@ -546,12 +543,9 @@ function handleFrame(m) {
   }
   // edge tab: route non-GEX channels before the gex-cell ingest
   if (typeof topic === 'string') {
-    if (topic.lastIndexOf('price:', 0) === 0) {                      // dedicated price tick → fast spot
+    if (topic.lastIndexOf('price:', 0) === 0) {
       const psym = topicToSym[topic] || topic.slice(6).toUpperCase();
-      const px = num(payload.price != null ? payload.price
-               : payload.last  != null ? payload.last
-               : payload.value != null ? payload.value
-               : payload.p     != null ? payload.p : payload.close);
+      const px = num(payload.price != null ? payload.price : payload.last != null ? payload.last : payload.value != null ? payload.value : payload.p != null ? payload.p : payload.close);
       if (psym && px > 0) { const st = S(psym); st.spot = px; st.lastMsg = Date.now(); pushSpot(psym); }
       return;
     }
