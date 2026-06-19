@@ -78,7 +78,7 @@ const momHist = {};   // sym -> [{ t, gex: { "strike|expiry": flow } }]   (match
 function ingest(sym, d) {
   if (!d || d.strike == null || !d.expiry) return;
   const st = S(sym);
-  const price = num(d.price); if (price > 0) st.spot = price;
+  const price = num(d.price); if (price > 0) { st.spot = price; pushSpot(sym); }   // fast spot push — beat the 1s grid flush
   st.ts = d.timestamp || Date.now();
   st.lastMsg = Date.now();
   const flow =
@@ -281,6 +281,27 @@ setInterval(() => {
   }
 }, SSE_FLUSH_MS);
 
+// ---- fast spot push --------------------------------------------------------
+// The heavy grid flushes ~1/sec; that throttle + the gamma cadence is the "spot
+// delay" users feel. So push a TINY spot-only SSE event (a named `spot` event)
+// the moment the price changes — independent of the grid. Debounced so a busy
+// symbol can't exceed ~SPOT_MIN_MS. The grid (and gex math) is unchanged.
+const SPOT_MIN_MS = 150;        // ≤ ~6–7 spot ticks/sec per symbol
+const spotPush = {};            // sym -> { last, timer }
+function pushSpot(sym) {
+  const subs = sse[sym]; if (!subs || !subs.size) return;
+  const rec = spotPush[sym] || (spotPush[sym] = { last: 0, timer: null });
+  const fire = () => {
+    rec.last = Date.now(); rec.timer = null;
+    const st = state[sym]; if (!st || !(st.spot > 0)) return;
+    const data = `event: spot\ndata: ${JSON.stringify({ symbol: sym, spot: st.spot, t: st.ts })}\n\n`;
+    for (const res of subs.keys()) { try { res.write(data); } catch {} }
+  };
+  const gap = Date.now() - rec.last;
+  if (gap >= SPOT_MIN_MS) fire();
+  else if (!rec.timer) rec.timer = setTimeout(fire, SPOT_MIN_MS - gap);
+}
+
 // snapshot the flow grid once a minute for the momentum seed (45-min rolling)
 setInterval(() => {
   const t = Date.now();
@@ -448,7 +469,11 @@ function joinChannel(sym) {
   const c = channels[sym]; if (!c) return;
   topicToSym[c.topic] = sym;
   wsSend({ channel: c.topic, msg_type: 'join' });
-  console.log('[join \u2192]', c.topic);
+  if (c.priceTopic) {                              // dedicated price-tick feed (index symbols)
+    topicToSym[c.priceTopic] = sym;
+    wsSend({ channel: c.priceTopic, msg_type: 'join' });
+  }
+  console.log('[join \u2192]', c.topic, c.priceTopic ? '+ ' + c.priceTopic : '');
 }
 
 function joinSym(sym, core) {
@@ -457,7 +482,10 @@ function joinSym(sym, core) {
     const dyn = Object.keys(subMeta).filter(s => !subMeta[s].core).length;
     if (dyn >= MAX_DYNAMIC) evictLRU();
   }
-  channels[sym] = { topic: `gex_strike_expiry:${sym}`, joined: false };
+  // Index symbols also subscribe the dedicated price-tick channel (lower latency than
+  // the gamma-piggybacked price). If UW gates it, the join just errors and we fall back
+  // to the gamma price — no regression. Stocks rely on their frequent gamma prints.
+  channels[sym] = { topic: `gex_strike_expiry:${sym}`, priceTopic: INDEX_LIKE.has(sym) ? `price:${sym}` : null, joined: false };
   subMeta[sym]  = { core: !!core, lastReq: Date.now() };
   if (wsReady) joinChannel(sym);            // socket up -> join now; else joined on (re)connect
 }
@@ -471,7 +499,11 @@ function ensureSub(sym) {
 
 function dropSym(sym) {
   const c = channels[sym];
-  if (c) { if (wsReady) wsSend({ channel: c.topic, msg_type: 'leave' }); delete topicToSym[c.topic]; }
+  if (c) {
+    if (wsReady) wsSend({ channel: c.topic, msg_type: 'leave' });
+    delete topicToSym[c.topic];
+    if (c.priceTopic) { if (wsReady) wsSend({ channel: c.priceTopic, msg_type: 'leave' }); delete topicToSym[c.priceTopic]; }
+  }
   delete channels[sym]; delete subMeta[sym]; delete state[sym]; delete momHist[sym];
 }
 
@@ -514,6 +546,15 @@ function handleFrame(m) {
   }
   // edge tab: route non-GEX channels before the gex-cell ingest
   if (typeof topic === 'string') {
+    if (topic.lastIndexOf('price:', 0) === 0) {                      // dedicated price tick → fast spot
+      const psym = topicToSym[topic] || topic.slice(6).toUpperCase();
+      const px = num(payload.price != null ? payload.price
+               : payload.last  != null ? payload.last
+               : payload.value != null ? payload.value
+               : payload.p     != null ? payload.p : payload.close);
+      if (psym && px > 0) { const st = S(psym); st.spot = px; st.lastMsg = Date.now(); pushSpot(psym); }
+      return;
+    }
     if (topic === 'flow-alerts' || topic.indexOf('flow-alerts') === 0) { onAlert('flow', payload); return; }
     if (DARKPOOL_CHANNEL && (topic === DARKPOOL_CHANNEL || topic.indexOf(DARKPOOL_CHANNEL) === 0)) { onDarkpool(payload); return; }
     if (topic.indexOf('option_trades') === 0) { onTrade(topic, payload); return; }
