@@ -230,11 +230,11 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-fulltape-1',
+    rev: 'uw-spxw-1',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     trades: Object.keys(tradeTopics),
-    spxPoll: _spxPollDbg,
+    spxw: { prints: _spxwN, last: _spxwLast, ageMs: _spxwTs ? now - _spxwTs : null },   // live SPX index value via SPXW tape
     symbols,
   });
 });
@@ -347,6 +347,12 @@ const alertsBuf   = [];   // [{source,…alert}] global ring
 const alertSubs   = new Set();
 let   alertsJoined = false;   // flow-alerts + dark pool joined only while someone views /alerts
 
+// UW is contractually barred from serving the Cboe SPX *index* price over the API, but SPX
+// weekly (SPXW) option prints carry the live index value in `underlying_price`. So we stream
+// option_trades:SPXW and route its underlying_price onto the SPX spot. (Per UW support.)
+const SPOT_ALIAS = { SPXW: 'SPX' };
+let _spxwN = 0, _spxwLast = 0, _spxwTs = 0;   // diagnostic: live SPX-spot prints seen via the SPXW tape
+
 const tradeTopic = (sym) => `option_trades:${sym}`;
 function ensureTrades(sym) {
   if (!sym) return; sym = sym.toUpperCase();
@@ -383,7 +389,11 @@ function onTrade(topic, p) {
   if (!sym) return;
   if (tradeMeta[sym]) tradeMeta[sym].lastReq = Date.now();
   const _up = num(p.underlying_price);
-  if (_up > 0) { const _st = S(sym); _st.spot = _up; _st.liveSpotTs = Date.now(); _st.lastMsg = Date.now(); pushSpot(sym); }   // precise live spot from the print tape (e.g. real SPX index value) — beats the snapped gamma price
+  if (_up > 0) {                                          // precise live spot from the print tape — beats the snapped gamma price
+    const spotSym = SPOT_ALIAS[sym] || sym;               // SPXW weekly prints carry the real SPX *index* value
+    const _st = S(spotSym); _st.spot = _up; _st.liveSpotTs = Date.now(); _st.lastMsg = Date.now(); pushSpot(spotSym);
+    if (spotSym === 'SPX') { _spxwN++; _spxwLast = _up; _spxwTs = Date.now(); }
+  }
   const row = shapeTrade(sym, p);
   const buf = tradesBuf[sym] || (tradesBuf[sym] = []);
   buf.push(row); if (buf.length > TRADES_KEEP) buf.shift();
@@ -446,7 +456,7 @@ app.get('/alerts', auth, (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const sym of Object.keys(tradeMeta)) {
-    if (sym === 'SPX') continue;   // SPX prints kept permanently for the live spot
+    if (sym === 'SPX' || sym === 'SPXW') continue;   // SPX/SPXW prints kept permanently for the live spot
     if (tradeSubs[sym] && tradeSubs[sym].size) continue;
     if (now - tradeMeta[sym].lastReq > IDLE_TTL_MS) { console.log('[trades idle drop]', sym); dropTrades(sym); }
   }
@@ -602,70 +612,13 @@ function connect() {
 
 // boot: register the core set, then connect (channels join on 'open')
 for (const sym of CORE) joinSym(sym, true);
-ensureTrades('SPX');   // keep SPX option prints flowing for a precise, live spot (underlying_price)
+ensureTrades('SPX');    // monthly SPX root (sparse) — also carries the index underlying_price
+ensureTrades('SPXW');   // SPX *weeklys* — the dense real-time stream; underlying_price = live SPX index value
 connect();
 
-// ---- live SPX spot via REST option-trades tape ------------------------------
-// SPX's *index* price is snapped to the nearest 5 on the gamma feed, and UW does NOT
-// push SPX index prints on the option_trades:SPX websocket channel — so the precise,
-// unsnapped value (e.g. 7473.72) only exists in the option-trades TAPE. That tape is
-// readable over REST on UW's Advanced API tier; the dashboard's gamma feed
-// (gex_strike_expiry) already requires that same Advanced tier, so this UW_KEY should
-// read the tape too. We poll the latest large SPX print and push its underlying_price
-// as the live SPX spot. Fully defensive: any non-200 / empty / no-SPX-row just keeps the
-// gamma-feed spot (no regression). /health.spxPoll shows the exact status for debugging.
-//   GET {base}/api/option-trades/full-tape/<ET-date>
-//       ?ticker_symbol=SPX&limit=20&order=executed_at&order_direction=desc&min_premium=50000
-const SPX_TAPE_BASE = (process.env.SPX_TAPE_BASE || 'https://api.unusualwhales.com').trim().replace(/\/+$/, '');
-const SPX_TAPE_MS   = Math.max(750, parseInt(process.env.SPX_TAPE_MS || '1500', 10) || 1500);
-const SPX_TAPE_LIM  = Math.max(1, parseInt(process.env.SPX_TAPE_LIMIT || '20', 10) || 20);
-const SPX_TAPE_MIN  = (process.env.SPX_TAPE_MIN_PREM || '50000').trim();   // '' to disable the premium floor
-let _spxRestOK = false, _spxRestLog = 0;
-let _spxPollDbg = 'init';
+// NOTE: live SPX spot now comes from the option_trades:SPXW websocket stream (joined at
+// boot above) — UW can't serve the Cboe index price directly, but SPXW prints carry it in
+// underlying_price, routed onto SPX in onTrade(). No REST polling needed. The full-tape
+// REST endpoint was an end-of-day archive (404 / NoSuchKey intraday), so it's gone.
 
-// today's ET trading date as YYYY-MM-DD (the tape is keyed by Eastern date)
-function etDate() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); }
-
-// freshest SPX underlying_price from a tape response (tolerant of envelope + ticker-param quirks)
-function spxFromTape(j) {
-  const arr = Array.isArray(j) ? j : (j && (j.data || j.result || j.chains || j.trades)) || [];
-  if (!Array.isArray(arr) || !arr.length) return { px: 0, n: 0 };
-  const isSpx = (r) => {
-    if (!r) return false;
-    if (String(r.underlying_symbol || '').toUpperCase() === 'SPX') return true;
-    const c = String(r.option_chain || r.option_symbol || r.option_chain_id || '').toUpperCase();
-    return c.indexOf('SPX') === 0;   // SPX… / SPXW… contract id
-  };
-  const row = arr.find(r => isSpx(r) && num(r.underlying_price) > 0);   // rows are newest-first
-  return { px: row ? num(row.underlying_price) : 0, n: arr.length };
-}
-
-async function pollSpxSpot() {
-  if (typeof fetch !== 'function') return;
-  const date = etDate();
-  const qs = 'ticker_symbol=SPX&limit=' + SPX_TAPE_LIM + '&order=executed_at&order_direction=desc'
-           + (SPX_TAPE_MIN ? '&min_premium=' + encodeURIComponent(SPX_TAPE_MIN) : '');
-  const url = `${SPX_TAPE_BASE}/api/option-trades/full-tape/${date}?${qs}`;
-  try {
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${UW_KEY}`, Accept: 'application/json' } });
-    if (!r.ok) {
-      let body = ''; try { body = (await r.text()).slice(0, 100).replace(/\s+/g, ' '); } catch {}
-      _spxPollDbg = `HTTP ${r.status} (${date}) ${body}`;
-      throw new Error('HTTP ' + r.status);
-    }
-    const j = await r.json();
-    const { px, n } = spxFromTape(j);
-    _spxPollDbg = `ok ${date} n=${n} up=${px || 'noSPXrow'}`;
-    if (px > 0) {
-      const st = S('SPX'); st.spot = px; st.liveSpotTs = Date.now(); st.ts = Date.now();
-      pushSpot('SPX');
-      if (!_spxRestOK) { _spxRestOK = true; console.log('[spx-tape] live SPX via full-tape =', px); }
-    }
-  } catch (e) {
-    if (Date.now() - _spxRestLog > 30000) { _spxRestLog = Date.now(); console.warn('[spx-tape] poll failed:', (e && e.message) || e); }
-  }
-}
-setInterval(pollSpxSpot, SPX_TAPE_MS);
-pollSpxSpot();
-
-app.listen(PORT, () => console.log(`[http] rev uw-proto-2 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
+app.listen(PORT, () => console.log(`[http] rev uw-spxw-1 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
