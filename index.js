@@ -79,6 +79,7 @@ function ingest(sym, d) {
   if (!d || d.strike == null || !d.expiry) return;
   const st = S(sym);
   const price = num(d.price);
+  if (price > 0) st.gammaSpot = price;   // always keep the raw gamma price (snapped-to-5 for indices) as a sanity anchor
   if (price > 0 && !(st.liveSpotTs && Date.now() - st.liveSpotTs < 15000)) { st.spot = price; pushSpot(sym); }   // gamma-piggybacked spot; don't clobber a fresher print/REST spot
   st.ts = d.timestamp || Date.now();
   st.lastMsg = Date.now();
@@ -230,13 +231,15 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-spxw-diag',
+    rev: 'uw-spxw-live',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     trades: Object.keys(tradeTopics),
-    spxw: { prints: _spxwN, last: _spxwLast, ageMs: _spxwTs ? now - _spxwTs : null },   // live SPX index value via SPXW tape
+    spxw: { prints: _spxwN, last: _spxwLast, ageMs: _spxwTs ? now - _spxwTs : null, mode: _spxMode, parityLegs: spxPar.legs.size },   // live SPX: mode = print | parity | gamma
     tradeAcks: joinAcks,        // diagnostic: per-channel join result (ok vs err:reason)
     tradeFrames: tradeFrameN,   // diagnostic: data frames received per trade channel
+    spxwSample: _spxwSample,    // diagnostic: raw SPXW print payload (inspect the underlying-price field)
+    aaplSample: _aaplSample,    // diagnostic: raw AAPL print payload (known-working comparison)
     symbols,
   });
 });
@@ -356,6 +359,41 @@ let   alertsJoined = false;   // flow-alerts + dark pool joined only while someo
 // option_trades:SPXW and route its underlying_price onto the SPX spot. (Per UW support.)
 const SPOT_ALIAS = { SPXW: 'SPX' };
 let _spxwN = 0, _spxwLast = 0, _spxwTs = 0;   // diagnostic: live SPX-spot prints seen via the SPXW tape
+let _spxwSample = '', _aaplSample = '';       // diagnostic: first raw WS print payload per channel (to inspect the price field)
+// underlying spot can ride under a few field names on the trade frames; never use `price` (that's the option price)
+const _UP_FIELDS = ['underlying_price', 'underlying', 'underlying_px', 'und_price', 'underlyingPrice', 'spot'];
+function underPx(p) { for (const f of _UP_FIELDS) { const v = num(p[f]); if (v > 0) return v; } return 0; }
+
+// ---- SPX live spot via 0DTE put-call parity (Cboe-safe: we DERIVE it, not read it) ----
+// UW blanks the SPX *index* price on the realtime socket, but the SPXW prints still carry
+// strike / option_type / price. For 0DTE, put-call parity gives  spot ≈ strike + call − put
+// (rate & time ≈ 0). We keep the latest call & put trade price per 0DTE strike and average the
+// few nearest-the-money strikes that have BOTH legs fresh → precise (±~0.2), sub-second.
+function etDate() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); }
+let _realUpTs = 0, _spxMode = 'gamma';                  // _realUpTs: last real underlying_price; _spxMode: print | parity | gamma
+const spxPar = { exp: '', legs: new Map() };            // 0DTE SPXW legs: strike -> { c, cT, p, pT }
+function recordParityLeg(p) {
+  const exp = p.expiry, k = num(p.strike), px = num(p.price);
+  if (!exp || !(k > 0) || !(px > 0)) return;
+  const today = etDate();
+  if (exp !== today) return;                            // 0DTE only — parity is exact only when time-to-expiry ≈ 0
+  if (spxPar.exp !== today) { spxPar.exp = today; spxPar.legs.clear(); }   // new day → fresh legs
+  const isCall = String(p.option_type || '').toLowerCase().charAt(0) === 'c';
+  let leg = spxPar.legs.get(k); if (!leg) { leg = { c: 0, cT: 0, p: 0, pT: 0 }; spxPar.legs.set(k, leg); }
+  const t = Date.now();
+  if (isCall) { leg.c = px; leg.cT = t; } else { leg.p = px; leg.pT = t; }
+}
+function spxParitySpot(est) {
+  const t = Date.now(), cand = [];
+  for (const [k, leg] of spxPar.legs) {
+    if (leg.cT && leg.pT && (t - leg.cT) < 4000 && (t - leg.pT) < 4000)   // both legs traded within the last 4s
+      cand.push({ s: k + leg.c - leg.p, d: Math.abs(k - est) });
+  }
+  if (!cand.length) return 0;
+  cand.sort((a, b) => a.d - b.d);
+  const near = cand.slice(0, 5);                         // nearest-ATM strikes → tightest spreads, least noise
+  return near.reduce((a, x) => a + x.s, 0) / near.length;
+}
 
 const tradeTopic = (sym) => `option_trades:${sym}`;
 function ensureTrades(sym) {
@@ -390,15 +428,18 @@ function shapeTrade(sym, p) {
 }
 function onTrade(topic, p) {
   tradeFrameN[topic] = (tradeFrameN[topic] || 0) + 1;   // diagnostic: count every trade frame routed here
+  if (topic === 'option_trades:SPXW' && !_spxwSample) _spxwSample = JSON.stringify(p).slice(0, 600);   // diagnostic: see the raw index-print shape
+  if (topic === 'option_trades:AAPL' && !_aaplSample) _aaplSample = JSON.stringify(p).slice(0, 600);   // diagnostic: working equity print for comparison
   const sym = tradeTopics[topic] || (p.underlying_symbol ? String(p.underlying_symbol).toUpperCase() : null);
   if (!sym) return;
   if (tradeMeta[sym]) tradeMeta[sym].lastReq = Date.now();
-  const _up = num(p.underlying_price);
+  const _up = underPx(p);
   if (_up > 0) {                                          // precise live spot from the print tape — beats the snapped gamma price
     const spotSym = SPOT_ALIAS[sym] || sym;               // SPXW weekly prints carry the real SPX *index* value
     const _st = S(spotSym); _st.spot = _up; _st.liveSpotTs = Date.now(); _st.lastMsg = Date.now(); pushSpot(spotSym);
-    if (spotSym === 'SPX') { _spxwN++; _spxwLast = _up; _spxwTs = Date.now(); }
+    if (spotSym === 'SPX') { _spxwN++; _spxwLast = _up; _spxwTs = Date.now(); _realUpTs = Date.now(); _spxMode = 'print'; }
   }
+  if (sym === 'SPXW') recordParityLeg(p);                 // feed the 0DTE parity fallback (used when the index price is blanked)
   const row = shapeTrade(sym, p);
   const buf = tradesBuf[sym] || (tradesBuf[sym] = []);
   buf.push(row); if (buf.length > TRADES_KEEP) buf.shift();
@@ -622,6 +663,20 @@ ensureTrades('SPX');    // monthly SPX root (sparse) — also carries the index 
 ensureTrades('SPXW');   // SPX *weeklys* — the dense real-time stream; underlying_price = live SPX index value
 ensureTrades('AAPL');   // TEMP diagnostic: equity control — if AAPL prints arrive but SPX/SPXW don't, it's index-gating; if none arrive, the option_trades channel isn't in this plan
 connect();
+
+// publish a derived SPX spot from 0DTE parity ~4x/sec — unless a real underlying_price is live
+setInterval(() => {
+  if (Date.now() - _realUpTs < 4000) return;             // a real index price is driving SPX — leave it alone
+  if (!spxPar.legs.size) return;
+  const st = S('SPX');
+  const ref = st.gammaSpot || st.spot || 0;              // snapped gamma price = sanity anchor
+  const ps  = spxParitySpot(ref > 0 ? ref : 7000);
+  if (ps > 0 && (!(ref > 0) || Math.abs(ps - ref) / ref < 0.02)) {   // reject bad legs: stay within 2% of the gamma anchor
+    st.spot = Math.round(ps * 100) / 100; st.liveSpotTs = Date.now(); st.ts = Date.now();
+    pushSpot('SPX');
+    _spxwN++; _spxwLast = st.spot; _spxwTs = Date.now(); _spxMode = 'parity';
+  }
+}, 250);
 
 // NOTE: live SPX spot now comes from the option_trades:SPXW websocket stream (joined at
 // boot above) — UW can't serve the Cboe index price directly, but SPXW prints carry it in
