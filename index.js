@@ -230,10 +230,11 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-proto-3-printspot',
+    rev: 'uw-proto-4-phxprice',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     trades: Object.keys(tradeTopics),
+    spxPoll: _spxPollDbg,
     symbols,
   });
 });
@@ -610,29 +611,35 @@ connect();
 // REST snapshot carries the real S&P 500 cash value ("US 500") live, so we poll it
 // ~1.2s and push it as the SPX spot. Fully defensive: any failure keeps the gamma-feed
 // spot. Override SPX_SPOT_URL / SPX_SPOT_NAME / SPX_SPOT_MS via env if the path differs.
-const SPX_SPOT_URL  = (process.env.SPX_SPOT_URL  || '').trim();   // off by default: SPX spot now comes from the option-print tape (underlying_price). Set this only to re-enable a REST source.
+const SPX_SPOT_URL  = (process.env.SPX_SPOT_URL  || 'https://phx.unusualwhales.com/api/ticker/SPX/price').trim();   // phx ticker price: { curr (live), prev (prior close) }
 const SPX_SPOT_NAME = (process.env.SPX_SPOT_NAME || 'US 500').trim();
 const SPX_SPOT_MS   = Math.max(500, parseInt(process.env.SPX_SPOT_MS || '1200', 10) || 1200);
 let _spxRestOK = false, _spxRestLog = 0;
+let _spxPollDbg = 'init';
 async function pollSpxSpot() {
   if (!SPX_SPOT_URL || typeof fetch !== 'function') return;
   try {
-    const r = await fetch(SPX_SPOT_URL, { headers: { Authorization: `Bearer ${UW_KEY}`, Accept: 'application/json' } });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const sep = SPX_SPOT_URL.indexOf('?') >= 0 ? '&' : '?';
+    const r = await fetch(SPX_SPOT_URL + sep + 'token=' + encodeURIComponent(UW_KEY), { headers: { Authorization: `Bearer ${UW_KEY}`, Accept: 'application/json' } });
+    if (!r.ok) { _spxPollDbg = 'HTTP ' + r.status; throw new Error('HTTP ' + r.status); }
     const j = await r.json();
-    const arr = Array.isArray(j) ? j : (j.result || j.data || j.chains || []);
-    const row = Array.isArray(arr) ? arr.find(x => x && x.name === SPX_SPOT_NAME) : null;
-    const px = row ? num(row.last != null ? row.last : row.price) : 0;
+    let px = 0;
+    if (j && (j.curr !== undefined || j.prev !== undefined)) {     // phx ticker price shape
+      px = num(j.curr);                                            // curr = live; prev = prior close (ignored)
+      _spxPollDbg = 'curr=' + (j.curr == null ? 'null' : j.curr) + ' prev=' + (j.prev == null ? 'null' : j.prev);
+    } else {                                                       // legacy array shape (futures-indices)
+      const arr = Array.isArray(j) ? j : (j.result || j.data || j.chains || []);
+      const row = Array.isArray(arr) ? arr.find(x => x && x.name === SPX_SPOT_NAME) : null;
+      px = row ? num(row.last != null ? row.last : row.price) : 0;
+      _spxPollDbg = 'arr:' + (Array.isArray(arr) ? arr.length : typeof j);
+    }
     if (px > 0) {
       const st = S('SPX'); st.spot = px; st.liveSpotTs = Date.now(); st.ts = Date.now();
       pushSpot('SPX');
-      if (!_spxRestOK) { _spxRestOK = true; console.log('[spx-rest] live SPX via', SPX_SPOT_URL, '·', SPX_SPOT_NAME, '=', px); }
-    } else if (!_spxRestOK && Date.now() - _spxRestLog > 30000) {
-      _spxRestLog = Date.now();
-      console.warn('[spx-rest] no "' + SPX_SPOT_NAME + '" row at ' + SPX_SPOT_URL + ' — sample names: ' + (Array.isArray(arr) ? arr.slice(0,3).map(x => x && x.name).join(', ') : typeof j) + ' (set SPX_SPOT_URL / SPX_SPOT_NAME)');
+      if (!_spxRestOK) { _spxRestOK = true; console.log('[spx-rest] live SPX via', SPX_SPOT_URL, '=', px); }
     }
   } catch (e) {
-    if (Date.now() - _spxRestLog > 30000) { _spxRestLog = Date.now(); console.warn('[spx-rest] poll failed:', (e && e.message) || e, '— SPX stays on the gamma feed (override SPX_SPOT_URL if the path is wrong).'); }
+    if (Date.now() - _spxRestLog > 30000) { _spxRestLog = Date.now(); console.warn('[spx-rest] poll failed:', (e && e.message) || e); }
   }
 }
 setInterval(pollSpxSpot, SPX_SPOT_MS);
