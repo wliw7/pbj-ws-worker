@@ -78,7 +78,8 @@ const momHist = {};   // sym -> [{ t, gex: { "strike|expiry": flow } }]   (match
 function ingest(sym, d) {
   if (!d || d.strike == null || !d.expiry) return;
   const st = S(sym);
-  const price = num(d.price); if (price > 0) { st.spot = price; pushSpot(sym); }   // fast spot push (beats the 1s grid flush)
+  const price = num(d.price);
+  if (price > 0 && !(sym === 'SPX' && st.restSpotTs && Date.now() - st.restSpotTs < 15000)) { st.spot = price; pushSpot(sym); }   // fast spot push; for SPX, don't clobber a fresh REST spot
   st.ts = d.timestamp || Date.now();
   st.lastMsg = Date.now();
   const flow =
@@ -595,5 +596,39 @@ function connect() {
 // boot: register the core set, then connect (channels join on 'open')
 for (const sym of CORE) joinSym(sym, true);
 connect();
+
+// ---- live SPX spot via REST -------------------------------------------------
+// UW gates the SPX *index* price on the websocket (the price:SPX channel is silent
+// on this plan), so SPX spot can only ride the gamma feed (~18s). UW's futures/indices
+// REST snapshot carries the real S&P 500 cash value ("US 500") live, so we poll it
+// ~1.2s and push it as the SPX spot. Fully defensive: any failure keeps the gamma-feed
+// spot. Override SPX_SPOT_URL / SPX_SPOT_NAME / SPX_SPOT_MS via env if the path differs.
+const SPX_SPOT_URL  = (process.env.SPX_SPOT_URL  || 'https://api.unusualwhales.com/api/market/indices-futures').trim();
+const SPX_SPOT_NAME = (process.env.SPX_SPOT_NAME || 'US 500').trim();
+const SPX_SPOT_MS   = Math.max(500, parseInt(process.env.SPX_SPOT_MS || '1200', 10) || 1200);
+let _spxRestOK = false, _spxRestLog = 0;
+async function pollSpxSpot() {
+  if (!SPX_SPOT_URL || typeof fetch !== 'function') return;
+  try {
+    const r = await fetch(SPX_SPOT_URL, { headers: { Authorization: `Bearer ${UW_KEY}`, Accept: 'application/json' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const arr = Array.isArray(j) ? j : (j.result || j.data || j.chains || []);
+    const row = Array.isArray(arr) ? arr.find(x => x && x.name === SPX_SPOT_NAME) : null;
+    const px = row ? num(row.last != null ? row.last : row.price) : 0;
+    if (px > 0) {
+      const st = S('SPX'); st.spot = px; st.restSpotTs = Date.now(); st.ts = Date.now();
+      pushSpot('SPX');
+      if (!_spxRestOK) { _spxRestOK = true; console.log('[spx-rest] live SPX via', SPX_SPOT_URL, '·', SPX_SPOT_NAME, '=', px); }
+    } else if (!_spxRestOK && Date.now() - _spxRestLog > 30000) {
+      _spxRestLog = Date.now();
+      console.warn('[spx-rest] no "' + SPX_SPOT_NAME + '" row at ' + SPX_SPOT_URL + ' — sample names: ' + (Array.isArray(arr) ? arr.slice(0,3).map(x => x && x.name).join(', ') : typeof j) + ' (set SPX_SPOT_URL / SPX_SPOT_NAME)');
+    }
+  } catch (e) {
+    if (Date.now() - _spxRestLog > 30000) { _spxRestLog = Date.now(); console.warn('[spx-rest] poll failed:', (e && e.message) || e, '— SPX stays on the gamma feed (override SPX_SPOT_URL if the path is wrong).'); }
+  }
+}
+setInterval(pollSpxSpot, SPX_SPOT_MS);
+pollSpxSpot();
 
 app.listen(PORT, () => console.log(`[http] rev uw-proto-2 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
