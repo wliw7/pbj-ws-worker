@@ -74,10 +74,16 @@ const num = (x) => { const n = parseFloat(x); return Number.isFinite(n) ? n : 0;
 const state = {};
 const S = (sym) => state[sym] || (state[sym] = { spot: 0, ts: 0, cells: new Map(), dirty: false, lastMsg: 0 });
 const momHist = {};   // sym -> [{ t, gex: { "strike|expiry": flow } }]   (matches the dashboard buffer shape)
+let _gexSamples = [];   // DIAGNOSTIC: raw SPX gamma-flow field values, to verify the dealer-sign convention
 
 function ingest(sym, d) {
   if (!d || d.strike == null || !d.expiry) return;
   const st = S(sym);
+  // DIAGNOSTIC: capture a few SPX gamma frames that have flow, to inspect the sign convention
+  if (sym === 'SPX' && _gexSamples.length < 8) {
+    const anyFlow = num(d.call_gamma_ask_vol) || num(d.call_gamma_bid_vol) || num(d.put_gamma_ask_vol) || num(d.put_gamma_bid_vol);
+    if (anyFlow) _gexSamples.push({ k: d.strike, exp: d.expiry, ca: d.call_gamma_ask_vol, cb: d.call_gamma_bid_vol, pa: d.put_gamma_ask_vol, pb: d.put_gamma_bid_vol, coi: d.call_gamma_oi, poi: d.put_gamma_oi });
+  }
   const price = num(d.price);
   if (price > 0) st.gammaSpot = price;   // always keep the raw gamma price (snapped-to-5 for indices) as a sanity anchor
   if (price > 0 && !(st.liveSpotTs && Date.now() - st.liveSpotTs < 15000)) { st.spot = price; pushSpot(sym); }   // gamma-piggybacked spot; don't clobber a fresher print/REST spot
@@ -231,12 +237,13 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-spx-live-all',
+    rev: 'uw-gex-verify',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     trades: Object.keys(tradeTopics),
     spxw: { prints: _spxwN, last: _spxwLast, ageMs: _spxwTs ? now - _spxwTs : null, mode: _spxMode, parityLegs: spxPar.legs.size },   // live SPX: mode = print | parity | gamma
     tradeFrames: tradeFrameN,   // frames received per trade channel (lightweight liveness check)
+    gexSamples: _gexSamples,    // DIAGNOSTIC: raw SPX gamma-flow fields (inspect ask/bid + call/put signs)
     symbols,
   });
 });
