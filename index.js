@@ -79,7 +79,7 @@ function ingest(sym, d) {
   if (!d || d.strike == null || !d.expiry) return;
   const st = S(sym);
   const price = num(d.price);
-  if (price > 0 && !(sym === 'SPX' && st.restSpotTs && Date.now() - st.restSpotTs < 15000)) { st.spot = price; pushSpot(sym); }   // fast spot push; for SPX, don't clobber a fresh REST spot
+  if (price > 0 && !(st.liveSpotTs && Date.now() - st.liveSpotTs < 15000)) { st.spot = price; pushSpot(sym); }   // gamma-piggybacked spot; don't clobber a fresher print/REST spot
   st.ts = d.timestamp || Date.now();
   st.lastMsg = Date.now();
   const flow =
@@ -378,6 +378,8 @@ function onTrade(topic, p) {
   const sym = tradeTopics[topic] || (p.underlying_symbol ? String(p.underlying_symbol).toUpperCase() : null);
   if (!sym) return;
   if (tradeMeta[sym]) tradeMeta[sym].lastReq = Date.now();
+  const _up = num(p.underlying_price);
+  if (_up > 0) { const _st = S(sym); _st.spot = _up; _st.liveSpotTs = Date.now(); _st.lastMsg = Date.now(); pushSpot(sym); }   // precise live spot from the print tape (e.g. real SPX index value) — beats the snapped gamma price
   const row = shapeTrade(sym, p);
   const buf = tradesBuf[sym] || (tradesBuf[sym] = []);
   buf.push(row); if (buf.length > TRADES_KEEP) buf.shift();
@@ -440,6 +442,7 @@ app.get('/alerts', auth, (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const sym of Object.keys(tradeMeta)) {
+    if (sym === 'SPX') continue;   // SPX prints kept permanently for the live spot
     if (tradeSubs[sym] && tradeSubs[sym].size) continue;
     if (now - tradeMeta[sym].lastReq > IDLE_TTL_MS) { console.log('[trades idle drop]', sym); dropTrades(sym); }
   }
@@ -595,6 +598,7 @@ function connect() {
 
 // boot: register the core set, then connect (channels join on 'open')
 for (const sym of CORE) joinSym(sym, true);
+ensureTrades('SPX');   // keep SPX option prints flowing for a precise, live spot (underlying_price)
 connect();
 
 // ---- live SPX spot via REST -------------------------------------------------
@@ -603,7 +607,7 @@ connect();
 // REST snapshot carries the real S&P 500 cash value ("US 500") live, so we poll it
 // ~1.2s and push it as the SPX spot. Fully defensive: any failure keeps the gamma-feed
 // spot. Override SPX_SPOT_URL / SPX_SPOT_NAME / SPX_SPOT_MS via env if the path differs.
-const SPX_SPOT_URL  = (process.env.SPX_SPOT_URL  || 'https://api.unusualwhales.com/api/market/indices-futures').trim();
+const SPX_SPOT_URL  = (process.env.SPX_SPOT_URL  || '').trim();   // off by default: SPX spot now comes from the option-print tape (underlying_price). Set this only to re-enable a REST source.
 const SPX_SPOT_NAME = (process.env.SPX_SPOT_NAME || 'US 500').trim();
 const SPX_SPOT_MS   = Math.max(500, parseInt(process.env.SPX_SPOT_MS || '1200', 10) || 1200);
 let _spxRestOK = false, _spxRestLog = 0;
@@ -617,7 +621,7 @@ async function pollSpxSpot() {
     const row = Array.isArray(arr) ? arr.find(x => x && x.name === SPX_SPOT_NAME) : null;
     const px = row ? num(row.last != null ? row.last : row.price) : 0;
     if (px > 0) {
-      const st = S('SPX'); st.spot = px; st.restSpotTs = Date.now(); st.ts = Date.now();
+      const st = S('SPX'); st.spot = px; st.liveSpotTs = Date.now(); st.ts = Date.now();
       pushSpot('SPX');
       if (!_spxRestOK) { _spxRestOK = true; console.log('[spx-rest] live SPX via', SPX_SPOT_URL, '·', SPX_SPOT_NAME, '=', px); }
     } else if (!_spxRestOK && Date.now() - _spxRestLog > 30000) {
