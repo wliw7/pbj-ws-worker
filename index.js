@@ -230,7 +230,7 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-proto-4-phxprice',
+    rev: 'uw-fulltape-1',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     trades: Object.keys(tradeTopics),
@@ -605,44 +605,67 @@ for (const sym of CORE) joinSym(sym, true);
 ensureTrades('SPX');   // keep SPX option prints flowing for a precise, live spot (underlying_price)
 connect();
 
-// ---- live SPX spot via REST -------------------------------------------------
-// UW gates the SPX *index* price on the websocket (the price:SPX channel is silent
-// on this plan), so SPX spot can only ride the gamma feed (~18s). UW's futures/indices
-// REST snapshot carries the real S&P 500 cash value ("US 500") live, so we poll it
-// ~1.2s and push it as the SPX spot. Fully defensive: any failure keeps the gamma-feed
-// spot. Override SPX_SPOT_URL / SPX_SPOT_NAME / SPX_SPOT_MS via env if the path differs.
-const SPX_SPOT_URL  = (process.env.SPX_SPOT_URL  || 'https://phx.unusualwhales.com/api/ticker/SPX/price').trim();   // phx ticker price: { curr (live), prev (prior close) }
-const SPX_SPOT_NAME = (process.env.SPX_SPOT_NAME || 'US 500').trim();
-const SPX_SPOT_MS   = Math.max(500, parseInt(process.env.SPX_SPOT_MS || '1200', 10) || 1200);
+// ---- live SPX spot via REST option-trades tape ------------------------------
+// SPX's *index* price is snapped to the nearest 5 on the gamma feed, and UW does NOT
+// push SPX index prints on the option_trades:SPX websocket channel — so the precise,
+// unsnapped value (e.g. 7473.72) only exists in the option-trades TAPE. That tape is
+// readable over REST on UW's Advanced API tier; the dashboard's gamma feed
+// (gex_strike_expiry) already requires that same Advanced tier, so this UW_KEY should
+// read the tape too. We poll the latest large SPX print and push its underlying_price
+// as the live SPX spot. Fully defensive: any non-200 / empty / no-SPX-row just keeps the
+// gamma-feed spot (no regression). /health.spxPoll shows the exact status for debugging.
+//   GET {base}/api/option-trades/full-tape/<ET-date>
+//       ?ticker_symbol=SPX&limit=20&order=executed_at&order_direction=desc&min_premium=50000
+const SPX_TAPE_BASE = (process.env.SPX_TAPE_BASE || 'https://api.unusualwhales.com').trim().replace(/\/+$/, '');
+const SPX_TAPE_MS   = Math.max(750, parseInt(process.env.SPX_TAPE_MS || '1500', 10) || 1500);
+const SPX_TAPE_LIM  = Math.max(1, parseInt(process.env.SPX_TAPE_LIMIT || '20', 10) || 20);
+const SPX_TAPE_MIN  = (process.env.SPX_TAPE_MIN_PREM || '50000').trim();   // '' to disable the premium floor
 let _spxRestOK = false, _spxRestLog = 0;
 let _spxPollDbg = 'init';
+
+// today's ET trading date as YYYY-MM-DD (the tape is keyed by Eastern date)
+function etDate() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); }
+
+// freshest SPX underlying_price from a tape response (tolerant of envelope + ticker-param quirks)
+function spxFromTape(j) {
+  const arr = Array.isArray(j) ? j : (j && (j.data || j.result || j.chains || j.trades)) || [];
+  if (!Array.isArray(arr) || !arr.length) return { px: 0, n: 0 };
+  const isSpx = (r) => {
+    if (!r) return false;
+    if (String(r.underlying_symbol || '').toUpperCase() === 'SPX') return true;
+    const c = String(r.option_chain || r.option_symbol || r.option_chain_id || '').toUpperCase();
+    return c.indexOf('SPX') === 0;   // SPX… / SPXW… contract id
+  };
+  const row = arr.find(r => isSpx(r) && num(r.underlying_price) > 0);   // rows are newest-first
+  return { px: row ? num(row.underlying_price) : 0, n: arr.length };
+}
+
 async function pollSpxSpot() {
-  if (!SPX_SPOT_URL || typeof fetch !== 'function') return;
+  if (typeof fetch !== 'function') return;
+  const date = etDate();
+  const qs = 'ticker_symbol=SPX&limit=' + SPX_TAPE_LIM + '&order=executed_at&order_direction=desc'
+           + (SPX_TAPE_MIN ? '&min_premium=' + encodeURIComponent(SPX_TAPE_MIN) : '');
+  const url = `${SPX_TAPE_BASE}/api/option-trades/full-tape/${date}?${qs}`;
   try {
-    const sep = SPX_SPOT_URL.indexOf('?') >= 0 ? '&' : '?';
-    const r = await fetch(SPX_SPOT_URL + sep + 'token=' + encodeURIComponent(UW_KEY), { headers: { Authorization: `Bearer ${UW_KEY}`, Accept: 'application/json' } });
-    if (!r.ok) { _spxPollDbg = 'HTTP ' + r.status; throw new Error('HTTP ' + r.status); }
-    const j = await r.json();
-    let px = 0;
-    if (j && (j.curr !== undefined || j.prev !== undefined)) {     // phx ticker price shape
-      px = num(j.curr);                                            // curr = live; prev = prior close (ignored)
-      _spxPollDbg = 'curr=' + (j.curr == null ? 'null' : j.curr) + ' prev=' + (j.prev == null ? 'null' : j.prev);
-    } else {                                                       // legacy array shape (futures-indices)
-      const arr = Array.isArray(j) ? j : (j.result || j.data || j.chains || []);
-      const row = Array.isArray(arr) ? arr.find(x => x && x.name === SPX_SPOT_NAME) : null;
-      px = row ? num(row.last != null ? row.last : row.price) : 0;
-      _spxPollDbg = 'arr:' + (Array.isArray(arr) ? arr.length : typeof j);
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${UW_KEY}`, Accept: 'application/json' } });
+    if (!r.ok) {
+      let body = ''; try { body = (await r.text()).slice(0, 100).replace(/\s+/g, ' '); } catch {}
+      _spxPollDbg = `HTTP ${r.status} (${date}) ${body}`;
+      throw new Error('HTTP ' + r.status);
     }
+    const j = await r.json();
+    const { px, n } = spxFromTape(j);
+    _spxPollDbg = `ok ${date} n=${n} up=${px || 'noSPXrow'}`;
     if (px > 0) {
       const st = S('SPX'); st.spot = px; st.liveSpotTs = Date.now(); st.ts = Date.now();
       pushSpot('SPX');
-      if (!_spxRestOK) { _spxRestOK = true; console.log('[spx-rest] live SPX via', SPX_SPOT_URL, '=', px); }
+      if (!_spxRestOK) { _spxRestOK = true; console.log('[spx-tape] live SPX via full-tape =', px); }
     }
   } catch (e) {
-    if (Date.now() - _spxRestLog > 30000) { _spxRestLog = Date.now(); console.warn('[spx-rest] poll failed:', (e && e.message) || e); }
+    if (Date.now() - _spxRestLog > 30000) { _spxRestLog = Date.now(); console.warn('[spx-tape] poll failed:', (e && e.message) || e); }
   }
 }
-setInterval(pollSpxSpot, SPX_SPOT_MS);
+setInterval(pollSpxSpot, SPX_TAPE_MS);
 pollSpxSpot();
 
 app.listen(PORT, () => console.log(`[http] rev uw-proto-2 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
