@@ -221,6 +221,8 @@ app.get('/health', (_req, res) => {
       cells: st ? st.cells.size : 0,
       spot: st ? st.spot : 0,
       lastMsgAgeMs: (st && st.lastMsg) ? now - st.lastMsg : null,
+      spotSrc: (st && st.liveSpotTs && now - st.liveSpotTs < 15000) ? 'print' : 'gamma',
+      liveAgeMs: (st && st.liveSpotTs) ? now - st.liveSpotTs : null,
       viewers: (sse[sym] && sse[sym].size) || 0,
     };
   }
@@ -228,9 +230,10 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-proto-2',
+    rev: 'uw-proto-3-printspot',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
+    trades: Object.keys(tradeTopics),
     symbols,
   });
 });
