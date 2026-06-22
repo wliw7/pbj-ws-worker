@@ -231,15 +231,12 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-spxw-live',
+    rev: 'uw-spx-live-all',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     trades: Object.keys(tradeTopics),
     spxw: { prints: _spxwN, last: _spxwLast, ageMs: _spxwTs ? now - _spxwTs : null, mode: _spxMode, parityLegs: spxPar.legs.size },   // live SPX: mode = print | parity | gamma
-    tradeAcks: joinAcks,        // diagnostic: per-channel join result (ok vs err:reason)
-    tradeFrames: tradeFrameN,   // diagnostic: data frames received per trade channel
-    spxwSample: _spxwSample,    // diagnostic: raw SPXW print payload (inspect the underlying-price field)
-    aaplSample: _aaplSample,    // diagnostic: raw AAPL print payload (known-working comparison)
+    tradeFrames: tradeFrameN,   // frames received per trade channel (lightweight liveness check)
     symbols,
   });
 });
@@ -354,12 +351,11 @@ const alertsBuf   = [];   // [{source,…alert}] global ring
 const alertSubs   = new Set();
 let   alertsJoined = false;   // flow-alerts + dark pool joined only while someone views /alerts
 
-// UW is contractually barred from serving the Cboe SPX *index* price over the API, but SPX
-// weekly (SPXW) option prints carry the live index value in `underlying_price`. So we stream
-// option_trades:SPXW and route its underlying_price onto the SPX spot. (Per UW support.)
+// UW is contractually barred from serving the Cboe SPX *index* price, so on the socket the SPXW
+// prints arrive with underlying_price BLANK. We map SPXW->SPX for the spot, and because that field
+// is empty we reconstruct SPX from the SPXW 0DTE call/put prints via put-call parity (see below).
 const SPOT_ALIAS = { SPXW: 'SPX' };
-let _spxwN = 0, _spxwLast = 0, _spxwTs = 0;   // diagnostic: live SPX-spot prints seen via the SPXW tape
-let _spxwSample = '', _aaplSample = '';       // diagnostic: first raw WS print payload per channel (to inspect the price field)
+let _spxwN = 0, _spxwLast = 0, _spxwTs = 0;   // SPX live-spot updates (parity or, if ever populated, a real print)
 // underlying spot can ride under a few field names on the trade frames; never use `price` (that's the option price)
 const _UP_FIELDS = ['underlying_price', 'underlying', 'underlying_px', 'und_price', 'underlyingPrice', 'spot'];
 function underPx(p) { for (const f of _UP_FIELDS) { const v = num(p[f]); if (v > 0) return v; } return 0; }
@@ -396,10 +392,10 @@ function spxParitySpot(est) {
 }
 
 const tradeTopic = (sym) => `option_trades:${sym}`;
-function ensureTrades(sym) {
+function ensureTrades(sym, pin) {   // pin = always-warm spot stream (never idle-dropped)
   if (!sym) return; sym = sym.toUpperCase();
-  if (tradeMeta[sym]) { tradeMeta[sym].lastReq = Date.now(); return; }
-  tradeMeta[sym] = { lastReq: Date.now() };
+  if (tradeMeta[sym]) { tradeMeta[sym].lastReq = Date.now(); if (pin) tradeMeta[sym].pin = true; return; }
+  tradeMeta[sym] = { lastReq: Date.now(), pin: !!pin };
   const topic = tradeTopic(sym); tradeTopics[topic] = sym;
   if (wsReady) wsSend({ channel: topic, msg_type: 'join' });
   console.log('[trades join \u2192]', topic);
@@ -427,9 +423,7 @@ function shapeTrade(sym, p) {
   };
 }
 function onTrade(topic, p) {
-  tradeFrameN[topic] = (tradeFrameN[topic] || 0) + 1;   // diagnostic: count every trade frame routed here
-  if (topic === 'option_trades:SPXW' && !_spxwSample) _spxwSample = JSON.stringify(p).slice(0, 600);   // diagnostic: see the raw index-print shape
-  if (topic === 'option_trades:AAPL' && !_aaplSample) _aaplSample = JSON.stringify(p).slice(0, 600);   // diagnostic: working equity print for comparison
+  tradeFrameN[topic] = (tradeFrameN[topic] || 0) + 1;   // per-channel frame counter (kept: cheap, handy for /health)
   const sym = tradeTopics[topic] || (p.underlying_symbol ? String(p.underlying_symbol).toUpperCase() : null);
   if (!sym) return;
   if (tradeMeta[sym]) tradeMeta[sym].lastReq = Date.now();
@@ -502,7 +496,7 @@ app.get('/alerts', auth, (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const sym of Object.keys(tradeMeta)) {
-    if (sym === 'SPX' || sym === 'SPXW') continue;   // SPX/SPXW prints kept permanently for the live spot
+    if (tradeMeta[sym].pin) continue;   // always-warm spot streams (SPXW + watchlist equities/ETFs) — never idle-drop
     if (tradeSubs[sym] && tradeSubs[sym].size) continue;
     if (now - tradeMeta[sym].lastReq > IDLE_TTL_MS) { console.log('[trades idle drop]', sym); dropTrades(sym); }
   }
@@ -659,9 +653,16 @@ function connect() {
 
 // boot: register the core set, then connect (channels join on 'open')
 for (const sym of CORE) joinSym(sym, true);
-ensureTrades('SPX');    // monthly SPX root (sparse) — also carries the index underlying_price
-ensureTrades('SPXW');   // SPX *weeklys* — the dense real-time stream; underlying_price = live SPX index value
-ensureTrades('AAPL');   // TEMP diagnostic: equity control — if AAPL prints arrive but SPX/SPXW don't, it's index-gating; if none arrive, the option_trades channel isn't in this plan
+// Always-warm live SPOT streams so every watchlist symbol ticks sub-second (vs the ~15s gamma cadence):
+//   • equities / ETFs → option_trades:<SYM> carries a live, precise underlying_price (like AAPL)
+//   • SPX             → option_trades:SPXW (0DTE weeklys) → spot via put-call parity (index price is blanked)
+//   • NDX / RUT       → index price blanked AND no dense 0DTE flow → stays on the gamma feed
+const INDEX_GATED = new Set(['SPX', 'NDX', 'RUT']);
+for (const sym of CORE) {
+  if (sym === 'SPX') { ensureTrades('SPXW', true); continue; }
+  if (INDEX_GATED.has(sym)) continue;
+  ensureTrades(sym, true);
+}
 connect();
 
 // publish a derived SPX spot from 0DTE parity ~4x/sec — unless a real underlying_price is live
