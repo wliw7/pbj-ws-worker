@@ -230,11 +230,13 @@ app.get('/health', (_req, res) => {
   const joinedCount = subs.filter(s => channels[s] && channels[s].joined).length;
   res.json({
     ok: true, socket: socketStatus, uptimeSec: Math.round(process.uptime()),
-    rev: 'uw-spxw-1',
+    rev: 'uw-spxw-diag',
     joins: { ok: joinedCount, total: subs.length },
     subs: { total: subs.length, core: subs.length - dynamic, dynamic, maxDynamic: MAX_DYNAMIC },
     trades: Object.keys(tradeTopics),
     spxw: { prints: _spxwN, last: _spxwLast, ageMs: _spxwTs ? now - _spxwTs : null },   // live SPX index value via SPXW tape
+    tradeAcks: joinAcks,        // diagnostic: per-channel join result (ok vs err:reason)
+    tradeFrames: tradeFrameN,   // diagnostic: data frames received per trade channel
     symbols,
   });
 });
@@ -343,6 +345,8 @@ const tradesBuf   = {};   // sym -> [print,…] newest last
 const tradeSubs   = {};   // sym -> Set(res)
 const tradeMeta   = {};   // sym -> { lastReq }
 const tradeTopics = {};   // 'option_trades:SYM' -> SYM
+const joinAcks    = {};   // topic -> 'ok' | 'err:...'   (diagnostic: did the channel join succeed?)
+const tradeFrameN = {};   // 'option_trades:SYM' -> # data frames received  (diagnostic)
 const alertsBuf   = [];   // [{source,…alert}] global ring
 const alertSubs   = new Set();
 let   alertsJoined = false;   // flow-alerts + dark pool joined only while someone views /alerts
@@ -385,6 +389,7 @@ function shapeTrade(sym, p) {
   };
 }
 function onTrade(topic, p) {
+  tradeFrameN[topic] = (tradeFrameN[topic] || 0) + 1;   // diagnostic: count every trade frame routed here
   const sym = tradeTopics[topic] || (p.underlying_symbol ? String(p.underlying_symbol).toUpperCase() : null);
   if (!sym) return;
   if (tradeMeta[sym]) tradeMeta[sym].lastReq = Date.now();
@@ -555,6 +560,7 @@ function handleFrame(m) {
   if (!payload || typeof payload !== 'object') return;
   if (payload.status !== undefined && payload.strike === undefined) {   // join / leave ack
     const jsym = topicToSym[topic];
+    joinAcks[topic] = payload.status === 'ok' ? 'ok' : ('err:' + JSON.stringify(payload.response || payload).slice(0, 80));
     if (payload.status !== 'ok') console.error('[join ERR]', topic, JSON.stringify(payload).slice(0, 160));
     else { if (jsym && channels[jsym]) channels[jsym].joined = true; console.log('[join ok]', topic); }
     return;
@@ -614,6 +620,7 @@ function connect() {
 for (const sym of CORE) joinSym(sym, true);
 ensureTrades('SPX');    // monthly SPX root (sparse) — also carries the index underlying_price
 ensureTrades('SPXW');   // SPX *weeklys* — the dense real-time stream; underlying_price = live SPX index value
+ensureTrades('AAPL');   // TEMP diagnostic: equity control — if AAPL prints arrive but SPX/SPXW don't, it's index-gating; if none arrive, the option_trades channel isn't in this plan
 connect();
 
 // NOTE: live SPX spot now comes from the option_trades:SPXW websocket stream (joined at
