@@ -691,4 +691,112 @@ setInterval(() => {
 // underlying_price, routed onto SPX in onTrade(). No REST polling needed. The full-tape
 // REST endpoint was an end-of-day archive (404 / NoSuchKey intraday), so it's gone.
 
+// ───────────────────────────────────────────────────────────────────────────
+// REPLAY RECORDER (optional) — persist the live flow-GEX grid to Postgres so a
+// past session can be replayed with FULL fidelity and ZERO REST calls. It records
+// only what's already streaming (the CORE symbols), gated to live frames (≈ market
+// hours). Cleanly disabled if DATABASE_URL / pg are absent — never blocks the desk.
+//   Storage: one row per (symbol, ~30s) holding the cumulative flow per cell.
+//   Serve:   GET /replay?symbol=SPX&date=YYYY-MM-DD&s=<ticket>
+// ───────────────────────────────────────────────────────────────────────────
+const DATABASE_URL    = (process.env.DATABASE_URL || '').trim();
+const REC_INTERVAL_MS = parseInt(process.env.REC_INTERVAL_MS || '30000', 10);
+const REC_BAND        = parseFloat(process.env.REC_BAND || '0.06');   // ±6% of spot (wider than the ±3.5% display)
+let pgPool = null;
+(function initRecorder() {
+  if (!DATABASE_URL) { console.log('[rec] DATABASE_URL not set — recorder OFF'); return; }
+  let Pool;
+  try { ({ Pool } = require('pg')); } catch { console.error('[rec] "pg" dependency missing — recorder OFF'); return; }
+  const needSSL = !/\.railway\.internal/.test(DATABASE_URL);   // internal Railway network needs no SSL; public proxy does
+  pgPool = new Pool({ connectionString: DATABASE_URL, ssl: needSSL ? { rejectUnauthorized: false } : false, max: 4 });
+  pgPool.query(`CREATE TABLE IF NOT EXISTS replay_frames (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    trade_date DATE NOT NULL,
+    ts TIMESTAMPTZ NOT NULL,
+    spot DOUBLE PRECISION,
+    cells JSONB NOT NULL
+  )`)
+    .then(() => pgPool.query(`CREATE INDEX IF NOT EXISTS replay_frames_lookup ON replay_frames (symbol, trade_date, ts)`))
+    .then(() => console.log('[rec] Postgres recorder ON (every ' + (REC_INTERVAL_MS / 1000) + 's)'))
+    .catch(e => { console.error('[rec] schema init failed:', e.message); pgPool = null; });
+})();
+
+function etDateStr(d) {   // trading date as YYYY-MM-DD in America/New_York
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
+  const g = t => (parts.find(x => x.type === t) || {}).value;
+  return `${g('year')}-${g('month')}-${g('day')}`;
+}
+async function recordFrame() {
+  if (!pgPool) return;
+  const now = Date.now();
+  for (const sym of CORE) {
+    const st = state[sym];
+    if (!st || !st.cells || !st.cells.size) continue;
+    if (!(st.lastMsg && now - st.lastMsg < 120000)) continue;   // live frames only → gates to RTH automatically
+    const spot = st.spot || 0; if (!(spot > 0)) continue;
+    const lo = spot * (1 - REC_BAND), hi = spot * (1 + REC_BAND);
+    const cells = {};
+    for (const [k, c] of st.cells) {
+      const strike = parseFloat(k);                              // key = "strike|expiry"
+      if (!(strike >= lo && strike <= hi)) continue;
+      if (c && c.flow) cells[k] = Math.round(c.flow);            // flow-GEX only (lean storage)
+    }
+    if (!Object.keys(cells).length) continue;
+    try {
+      await pgPool.query(
+        `INSERT INTO replay_frames (symbol, trade_date, ts, spot, cells) VALUES ($1,$2,to_timestamp($3),$4,$5)`,
+        [sym, etDateStr(new Date(now)), now / 1000, spot, JSON.stringify(cells)]
+      );
+    } catch (e) { /* recording must never break the worker */ }
+  }
+}
+if (DATABASE_URL) setInterval(recordFrame, REC_INTERVAL_MS);
+
+// recorded full-fidelity frames for one past session (full-grid frames; the page normalizes both sources)
+app.get('/replay', auth, async (req, res) => {
+  try {
+    if (!pgPool) return res.status(503).json({ error: 'recorder not configured (no DATABASE_URL)' });
+    const sym = String(req.query.symbol || 'SPX').toUpperCase();
+    const date = String(req.query.date || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date=YYYY-MM-DD required' });
+    let rows;
+    try {
+      const q = await pgPool.query(
+        `SELECT extract(epoch from ts) * 1000 AS t, spot, cells FROM replay_frames
+         WHERE symbol = $1 AND trade_date = $2 ORDER BY ts ASC`, [sym, date]);
+      rows = q.rows;
+    } catch (e) { return res.status(502).json({ error: 'db: ' + e.message }); }
+    if (!rows.length) return res.status(404).json({ error: `no recording for ${sym} on ${date}` });
+
+    const spots = rows.map(r => +r.spot).filter(s => s > 0).sort((a, b) => a - b);
+    const spotMid = spots[Math.floor(spots.length / 2)] || 0;
+    const lo = spotMid * 0.965, hi = spotMid * 1.035;
+    const kSet = new Set(), eSet = new Set();
+    for (const r of rows) for (const key in r.cells) {
+      const bar = key.split('|'); const k = parseFloat(bar[0]), exp = bar[1];
+      if (k >= lo && k <= hi && exp >= date) { kSet.add(k); eSet.add(exp); }
+    }
+    const strikes = [...kSet].sort((a, b) => b - a);
+    const expiries = [...eSet].sort().slice(0, 6);
+    const expOk = new Set(expiries);
+    const sIdx = new Map(strikes.map((k, i) => [k, i]));
+    const eIdx = new Map(expiries.map((e, i) => [e, i]));
+    const frames = rows.map(r => {
+      const grid = strikes.map(() => expiries.map(() => 0));
+      for (const key in r.cells) {
+        const bar = key.split('|'); const k = parseFloat(bar[0]), exp = bar[1];
+        if (sIdx.has(k) && expOk.has(exp)) grid[sIdx.get(k)][eIdx.get(exp)] = r.cells[key];
+      }
+      return { t: new Date(+r.t).toISOString().slice(0, 16), spot: Math.round(+r.spot * 100) / 100, grid };
+    });
+    res.json({
+      symbol: sym, date, source: 'ws',
+      strikes,
+      expiries: expiries.map(e => ({ date: e, label: labelFor(e), dte: Math.round((Date.parse(e + 'T00:00:00Z') - Date.parse(date + 'T00:00:00Z')) / 864e5) })),
+      frames, spot: Math.round(spotMid * 100) / 100, recorded: rows.length,
+    });
+  } catch (e) { try { res.status(500).json({ error: 'replay: ' + e.message }); } catch {} }
+});
+
 app.listen(PORT, () => console.log(`[http] rev uw-spxw-1 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
