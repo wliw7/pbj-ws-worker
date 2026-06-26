@@ -351,6 +351,8 @@ const DARKPOOL_MIN_NOTIONAL = parseFloat(process.env.DARKPOOL_MIN_NOTIONAL || '1
 const tradesBuf   = {};   // sym -> [print,…] newest last
 const tradeSubs   = {};   // sym -> Set(res)
 const tradeMeta   = {};   // sym -> { lastReq }
+const purAcc      = {};   // sym -> Map("strike|expiry|type" -> {vol, ml})  single-leg purity source for the recorder
+let   _recDate    = '';   // ET date of the current purity accumulation (cleared on day rollover)
 const tradeTopics = {};   // 'option_trades:SYM' -> SYM
 const joinAcks    = {};   // topic -> 'ok' | 'err:...'   (diagnostic: did the channel join succeed?)
 const tradeFrameN = {};   // 'option_trades:SYM' -> # data frames received  (diagnostic)
@@ -441,6 +443,13 @@ function onTrade(topic, p) {
     if (spotSym === 'SPX') { _spxwN++; _spxwLast = _up; _spxwTs = Date.now(); _realUpTs = Date.now(); _spxMode = 'print'; }
   }
   if (sym === 'SPXW') recordParityLeg(p);                 // feed the 0DTE parity fallback (used when the index price is blanked)
+  // single-leg purity for the replay recorder: keep the latest cumulative vol/ml per contract
+  if (p.strike != null && p.expiry && num(p.volume) > 0) {
+    const purSym = SPOT_ALIAS[sym] || sym;                // SPXW prints' purity belongs to SPX cells
+    const pm = purAcc[purSym] || (purAcc[purSym] = new Map());
+    const ty = String(p.option_type || '').charAt(0).toUpperCase();   // 'C' / 'P'
+    pm.set(`${num(p.strike)}|${p.expiry}|${ty}`, { vol: num(p.volume), ml: num(p.multi_vol) });
+  }
   const row = shapeTrade(sym, p);
   const buf = tradesBuf[sym] || (tradesBuf[sym] = []);
   buf.push(row); if (buf.length > TRADES_KEEP) buf.shift();
@@ -702,6 +711,7 @@ setInterval(() => {
 const DATABASE_URL    = (process.env.DATABASE_URL || '').trim();
 const REC_INTERVAL_MS = parseInt(process.env.REC_INTERVAL_MS || '30000', 10);
 const REC_BAND        = parseFloat(process.env.REC_BAND || '0.06');   // ±6% of spot (wider than the ±3.5% display)
+const REC_EXPIRIES    = parseInt(process.env.REC_EXPIRIES || '12', 10);   // nearest N future expiries to record (bounds storage)
 let pgPool = null;
 (function initRecorder() {
   if (!DATABASE_URL) { console.log('[rec] DATABASE_URL not set — recorder OFF'); return; }
@@ -730,23 +740,38 @@ function etDateStr(d) {   // trading date as YYYY-MM-DD in America/New_York
 async function recordFrame() {
   if (!pgPool) return;
   const now = Date.now();
+  const today = etDateStr(new Date(now));
+  if (today !== _recDate) { _recDate = today; for (const s in purAcc) purAcc[s].clear(); }   // new session → reset purity accumulation
   for (const sym of CORE) {
     const st = state[sym];
     if (!st || !st.cells || !st.cells.size) continue;
     if (!(st.lastMsg && now - st.lastMsg < 120000)) continue;   // live frames only → gates to RTH automatically
     const spot = st.spot || 0; if (!(spot > 0)) continue;
     const lo = spot * (1 - REC_BAND), hi = spot * (1 + REC_BAND);
+    // keep only the nearest REC_EXPIRIES future expiries (bounds storage)
+    const exps = new Set();
+    for (const k of st.cells.keys()) { const e = k.slice(k.indexOf('|') + 1); if (e >= today) exps.add(e); }
+    const keep = new Set([...exps].sort().slice(0, REC_EXPIRIES));
+    const pm = purAcc[sym];
     const cells = {};
     for (const [k, c] of st.cells) {
-      const strike = parseFloat(k);                              // key = "strike|expiry"
-      if (!(strike >= lo && strike <= hi)) continue;
-      if (c && c.flow) cells[k] = Math.round(c.flow);            // flow-GEX only (lean storage)
+      const strike = parseFloat(k); const exp = k.slice(k.indexOf('|') + 1);   // key = "strike|expiry"
+      if (!(strike >= lo && strike <= hi) || !keep.has(exp) || !c) continue;
+      const f = Math.round(c.flow || 0), s = Math.round(c.standing || 0), v = Math.round(c.vanna || 0);
+      if (!(f || s || v)) continue;
+      let pur = -1;                                             // single-leg purity %, -1 = unknown
+      if (pm) {
+        const cc = pm.get(k + '|C'), pp = pm.get(k + '|P');
+        const vv = (cc ? cc.vol : 0) + (pp ? pp.vol : 0), mm = (cc ? cc.ml : 0) + (pp ? pp.ml : 0);
+        if (vv > 0) pur = Math.max(0, Math.min(100, Math.round((1 - mm / vv) * 100)));
+      }
+      cells[k] = [f, s, v, pur];                               // [flow, standing, vanna, purity%]
     }
     if (!Object.keys(cells).length) continue;
     try {
       await pgPool.query(
         `INSERT INTO replay_frames (symbol, trade_date, ts, spot, cells) VALUES ($1,$2,to_timestamp($3),$4,$5)`,
-        [sym, etDateStr(new Date(now)), now / 1000, spot, JSON.stringify(cells)]
+        [sym, today, now / 1000, spot, JSON.stringify(cells)]
       );
     } catch (e) { /* recording must never break the worker */ }
   }
@@ -769,6 +794,7 @@ app.get('/replay', auth, async (req, res) => {
     } catch (e) { return res.status(502).json({ error: 'db: ' + e.message }); }
     if (!rows.length) return res.status(404).json({ error: `no recording for ${sym} on ${date}` });
 
+    const quad = v => { const a = Array.isArray(v) ? v.slice() : [v || 0, 0, 0]; while (a.length < 4) a.push(-1); return a; };   // back-compat: number→flow-only, 3-len→no purity
     const spots = rows.map(r => +r.spot).filter(s => s > 0).sort((a, b) => a - b);
     const spotMid = spots[Math.floor(spots.length / 2)] || 0;
     const lo = spotMid * 0.965, hi = spotMid * 1.035;
@@ -778,23 +804,30 @@ app.get('/replay', auth, async (req, res) => {
       if (k >= lo && k <= hi && exp >= date) { kSet.add(k); eSet.add(exp); }
     }
     const strikes = [...kSet].sort((a, b) => b - a);
-    const expiries = [...eSet].sort().slice(0, 6);
+    const expiries = [...eSet].sort().slice(0, 10);            // nearest 10 expiries
     const expOk = new Set(expiries);
     const sIdx = new Map(strikes.map((k, i) => [k, i]));
     const eIdx = new Map(expiries.map((e, i) => [e, i]));
-    const frames = rows.map(r => {
-      const grid = strikes.map(() => expiries.map(() => 0));
+    // cap payload: at most ~420 frames (keeps the JSON a few MB and plays smooth)
+    let sel = rows; const MAXF = 420;
+    if (rows.length > MAXF) { const step = Math.ceil(rows.length / MAXF); sel = rows.filter((_, i) => i % step === 0 || i === rows.length - 1); }
+    const blank = () => strikes.map(() => expiries.map(() => 0));
+    const blankP = () => strikes.map(() => expiries.map(() => -1));
+    const frames = sel.map(r => {
+      const flow = blank(), standing = blank(), vanna = blank(), pure = blankP();
       for (const key in r.cells) {
         const bar = key.split('|'); const k = parseFloat(bar[0]), exp = bar[1];
-        if (sIdx.has(k) && expOk.has(exp)) grid[sIdx.get(k)][eIdx.get(exp)] = r.cells[key];
+        if (!sIdx.has(k) || !expOk.has(exp)) continue;
+        const t = quad(r.cells[key]); const si = sIdx.get(k), ei = eIdx.get(exp);
+        flow[si][ei] = t[0]; standing[si][ei] = t[1]; vanna[si][ei] = t[2]; pure[si][ei] = t[3];
       }
-      return { t: new Date(+r.t).toISOString().slice(0, 16), spot: Math.round(+r.spot * 100) / 100, grid };
+      return { t: new Date(+r.t).toISOString().slice(0, 16), spot: Math.round(+r.spot * 100) / 100, flow, standing, vanna, pure };
     });
     res.json({
       symbol: sym, date, source: 'ws',
       strikes,
       expiries: expiries.map(e => ({ date: e, label: labelFor(e), dte: Math.round((Date.parse(e + 'T00:00:00Z') - Date.parse(date + 'T00:00:00Z')) / 864e5) })),
-      frames, spot: Math.round(spotMid * 100) / 100, recorded: rows.length,
+      frames, spot: Math.round(spotMid * 100) / 100, recorded: rows.length, served: frames.length,
     });
   } catch (e) { try { res.status(500).json({ error: 'replay: ' + e.message }); } catch {} }
 });
