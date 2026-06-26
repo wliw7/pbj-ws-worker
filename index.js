@@ -712,6 +712,8 @@ const DATABASE_URL    = (process.env.DATABASE_URL || '').trim();
 const REC_INTERVAL_MS = parseInt(process.env.REC_INTERVAL_MS || '30000', 10);
 const REC_BAND        = parseFloat(process.env.REC_BAND || '0.06');   // ±6% of spot (wider than the ±3.5% display)
 const REC_EXPIRIES    = parseInt(process.env.REC_EXPIRIES || '12', 10);   // nearest N future expiries to record (bounds storage)
+const REC_RETAIN_DAYS = parseInt(process.env.REC_RETAIN_DAYS || '7', 10);   // keep this many days of full-grid replay history (older auto-pruned daily)
+const REC_LEVELS_DAYS = parseInt(process.env.REC_LEVELS_DAYS || '95', 10);   // keep this many days of the lean levels history (drives the 3-month chart)
 let pgPool = null;
 (function initRecorder() {
   if (!DATABASE_URL) { console.log('[rec] DATABASE_URL not set — recorder OFF'); return; }
@@ -728,6 +730,11 @@ let pgPool = null;
     cells JSONB NOT NULL
   )`)
     .then(() => pgPool.query(`CREATE INDEX IF NOT EXISTS replay_frames_lookup ON replay_frames (symbol, trade_date, ts)`))
+    .then(() => pgPool.query(`CREATE TABLE IF NOT EXISTS replay_levels (
+      id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, trade_date DATE NOT NULL, ts TIMESTAMPTZ NOT NULL,
+      spot DOUBLE PRECISION, flip DOUBLE PRECISION, call_wall DOUBLE PRECISION, put_wall DOUBLE PRECISION,
+      node DOUBLE PRECISION, pull DOUBLE PRECISION, peak DOUBLE PRECISION, net_gex DOUBLE PRECISION, net_vanna DOUBLE PRECISION)`))
+    .then(() => pgPool.query(`CREATE INDEX IF NOT EXISTS replay_levels_lookup ON replay_levels (symbol, ts)`))
     .then(() => console.log('[rec] Postgres recorder ON (every ' + (REC_INTERVAL_MS / 1000) + 's)'))
     .catch(e => { console.error('[rec] schema init failed:', e.message); pgPool = null; });
 })();
@@ -774,9 +781,58 @@ async function recordFrame() {
         [sym, today, now / 1000, spot, JSON.stringify(cells)]
       );
     } catch (e) { /* recording must never break the worker */ }
+    try {
+      const lv = computeLevels(st, spot);
+      if (lv) await pgPool.query(
+        `INSERT INTO replay_levels (symbol, trade_date, ts, spot, flip, call_wall, put_wall, node, pull, peak, net_gex, net_vanna)
+         VALUES ($1,$2,to_timestamp($3),$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [sym, today, now / 1000, lv.spot, lv.flip, lv.call_wall, lv.put_wall, lv.node, lv.pull, lv.peak, lv.net_gex, lv.net_vanna]);
+    } catch (e) { /* levels recording must never break the worker */ }
   }
 }
-if (DATABASE_URL) setInterval(recordFrame, REC_INTERVAL_MS);
+// ticker-level levels (aggregate across expiries within ±band) for the history chart
+function computeLevels(st, spot) {
+  if (!(spot > 0) || !st.cells || !st.cells.size) return null;
+  const lo = spot * (1 - REC_BAND), hi = spot * (1 + REC_BAND);
+  const byK = new Map();
+  for (const [key, c] of st.cells) {
+    const k = parseFloat(key); if (!(k >= lo && k <= hi) || !c) continue;
+    const a = byK.get(k) || { std: 0, flow: 0, vanna: 0 };
+    a.std += (c.standing || 0); a.flow += (c.flow || 0); a.vanna += (c.vanna || 0); byK.set(k, a);
+  }
+  const strikes = [...byK.keys()].sort((a, b) => b - a);   // high -> low
+  if (!strikes.length) return null;
+  let flip = null, cum = 0, prev = 0, prevK = null;
+  for (const k of strikes) { prev = cum; cum += byK.get(k).std; if (prevK !== null && ((prev >= 0 && cum < 0) || (prev < 0 && cum >= 0))) { flip = Math.round((k + prevK) / 2); break; } prevK = k; }
+  let cw = null, cwv = -Infinity, pw = null, pwv = Infinity, peak = null, pkv = 0, netGex = 0, netVanna = 0;
+  for (const k of strikes) { const a = byK.get(k);
+    if (k > spot && a.std > cwv) { cwv = a.std; cw = k; }
+    if (k < spot && a.std < pwv) { pwv = a.std; pw = k; }
+    if (Math.abs(a.flow) > Math.abs(pkv)) { pkv = a.flow; peak = k; }
+    netGex += a.flow; netVanna += a.vanna;
+  }
+  if (!(cwv > 0)) cw = null; if (!(pwv < 0)) pw = null;
+  let ws = 0, ks = 0;
+  for (const k of strikes) { if (Math.abs(k - spot) / spot > 0.025) continue; const prox = Math.exp(-Math.pow((k - spot) / (spot * 0.012), 2)); const w = Math.abs(byK.get(k).std) * prox; ws += w; ks += k * w; }
+  const node = ws > 0 ? Math.round(ks / ws * 100) / 100 : null;
+  const pull = node != null ? Math.round((node - spot) * 100) / 100 : null;
+  return { spot: Math.round(spot * 100) / 100, flip, call_wall: cw, put_wall: pw, node, pull, peak, net_gex: Math.round(netGex), net_vanna: Math.round(netVanna) };
+}
+// retention: drop frames older than REC_RETAIN_DAYS so Railway storage stays flat
+async function pruneOldFrames() {
+  if (!pgPool || !(REC_RETAIN_DAYS > 0)) return;
+  try {
+    const r = await pgPool.query(`DELETE FROM replay_frames WHERE trade_date < (CURRENT_DATE - $1::int)`, [REC_RETAIN_DAYS]);
+    if (r.rowCount) console.log(`[rec] pruned ${r.rowCount} frames older than ${REC_RETAIN_DAYS}d`);
+    const rl = await pgPool.query(`DELETE FROM replay_levels WHERE trade_date < (CURRENT_DATE - $1::int)`, [REC_LEVELS_DAYS]);
+    if (rl.rowCount) console.log(`[rec] pruned ${rl.rowCount} level rows older than ${REC_LEVELS_DAYS}d`);
+  } catch (e) { console.error('[rec] prune failed:', e.message); }
+}
+if (DATABASE_URL) {
+  setInterval(recordFrame, REC_INTERVAL_MS);
+  setTimeout(pruneOldFrames, 60000);                 // first sweep ~1 min after boot
+  setInterval(pruneOldFrames, 12 * 3600 * 1000);     // then twice a day
+}
 
 // recorded full-fidelity frames for one past session (full-grid frames; the page normalizes both sources)
 app.get('/replay', auth, async (req, res) => {
@@ -830,6 +886,34 @@ app.get('/replay', auth, async (req, res) => {
       frames, spot: Math.round(spotMid * 100) / 100, recorded: rows.length, served: frames.length,
     });
   } catch (e) { try { res.status(500).json({ error: 'replay: ' + e.message }); } catch {} }
+});
+
+// GET /levels?symbol=SPX&days=90&res=15m — ticker-level history (spot OHLC + flip/walls/node/peak), bucketed to the timeframe
+app.get('/levels', auth, async (req, res) => {
+  try {
+    if (!pgPool) return res.status(503).json({ error: 'recorder not configured (no DATABASE_URL)' });
+    const sym = String(req.query.symbol || 'SPX').toUpperCase();
+    const days = Math.min(120, Math.max(1, parseInt(req.query.days || '90', 10)));
+    const resStr = String(req.query.res || '15m');
+    const bucket = { '1m': 60, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 }[resStr] || 900;
+    let rows;
+    try {
+      const q = await pgPool.query(
+        `SELECT extract(epoch from ts) AS t, spot, flip, call_wall, put_wall, node, peak, net_gex, net_vanna
+         FROM replay_levels WHERE symbol = $1 AND ts > now() - ($2 * interval '1 day') ORDER BY ts ASC`, [sym, days]);
+      rows = q.rows;
+    } catch (e) { return res.status(502).json({ error: 'db: ' + e.message }); }
+    if (!rows.length) return res.status(404).json({ error: `no level history for ${sym} yet` });
+    // bucket to the requested timeframe: OHLC on spot, last value for each level
+    const out = []; let bk = -1, b = null;
+    for (const r of rows) {
+      const t = +r.t, key = Math.floor(t / bucket) * bucket, s = +r.spot;
+      if (key !== bk) { if (b) out.push(b); bk = key; b = { t: key, o: s, h: s, l: s, c: s, flip: r.flip, cw: r.call_wall, pw: r.put_wall, node: r.node, peak: r.peak, gex: r.net_gex, vanna: r.net_vanna }; }
+      else { if (s > b.h) b.h = s; if (s < b.l) b.l = s; b.c = s; b.flip = r.flip; b.cw = r.call_wall; b.pw = r.put_wall; b.node = r.node; b.peak = r.peak; b.gex = r.net_gex; b.vanna = r.net_vanna; }
+    }
+    if (b) out.push(b);
+    res.json({ symbol: sym, res: resStr, days, points: out.length, series: out });
+  } catch (e) { try { res.status(500).json({ error: 'levels: ' + e.message }); } catch {} }
 });
 
 app.listen(PORT, () => console.log(`[http] rev uw-spxw-1 listening on :${PORT} — core: ${CORE.join(', ')} | on-demand: any other ticker (max ${MAX_DYNAMIC})`));
