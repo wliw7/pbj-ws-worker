@@ -46,6 +46,9 @@ const WebSocket = require('ws');
 const UW_KEY         = (process.env.UW_KEY || '').trim();   // trim: kill any stray whitespace/newline from the env paste
 const PORT           = parseInt(process.env.PORT || '8080', 10);
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
+// M1: without SESSION_SECRET the worker now fails CLOSED (every request 401s), matching the
+// Netlify functions. Open "dev mode" is available ONLY with an explicit opt-in, never by default.
+const ALLOW_OPEN_AUTH = process.env.ALLOW_OPEN_AUTH === '1';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 // Always-warm CORE: subscribed at boot, never evicted (instant load for these).
 const CORE           = (process.env.SYMBOLS || 'SPX,SPY,QQQ,IWM,NDX,DIA,AAPL,NVDA,TSLA')
@@ -56,6 +59,11 @@ const N_EXPIRIES     = parseInt(process.env.N_EXPIRIES || '5', 10);
 // of always-on streams.
 const MAX_DYNAMIC    = parseInt(process.env.MAX_DYNAMIC || '60', 10);     // cap on concurrent on-demand subs
 const IDLE_TTL_MS    = parseInt(process.env.IDLE_TTL_MS || '600000', 10); // drop a dynamic sub after this idle (10 min)
+// M2: strip non-directional multi-leg (spread/combo) volume from the LIVE flow grid so live
+// Flow GEX uses the SAME single-leg methodology as the EOD gex.js path (slFrac = 1 - multi_leg/vol).
+// Per-cell purity comes from the option_trades tape (purAcc), the same source as the PURE column.
+// Default ON; set STRIP_MULTILEG=0 on Railway to show UW's gross flow (pre-fix behavior) instantly.
+const STRIP_MULTILEG = process.env.STRIP_MULTILEG !== '0';
 
 const INDEX_LIKE  = new Set(['SPX', 'NDX', 'RUT', 'SPY', 'QQQ', 'IWM', 'DIA']);
 const BAND_INDEX  = 0.03;   // ±3% strike window for index-like
@@ -65,7 +73,10 @@ const HIST_STEP_MS = 60000;        // snapshot the flow grid once a minute
 const SSE_FLUSH_MS = 1000;         // push to SSE clients at most once a second
 
 if (!UW_KEY) { console.error('FATAL: UW_KEY not set'); process.exit(1); }
-if (!SESSION_SECRET) console.warn('[warn] SESSION_SECRET unset — auth is OPEN (dev mode). Set it in production.');
+if (!SESSION_SECRET) {
+  if (ALLOW_OPEN_AUTH) console.warn('[warn] SESSION_SECRET unset + ALLOW_OPEN_AUTH=1 — auth is OPEN. DEV ONLY; never run this in production.');
+  else console.error('[auth] SESSION_SECRET unset — auth DISABLED: every /stream and /trades request will 401. Set SESSION_SECRET in production (or ALLOW_OPEN_AUTH=1 for local dev).');
+}
 
 const num = (x) => { const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
 
@@ -113,6 +124,17 @@ function dteFor(dateStr) {
   return Math.round((d - today) / 86400000);
 }
 
+// M2: single-leg fraction (1 - multi_leg/vol) for a cell key "strike|expiry", from the option_trades
+// purity accumulator (purAcc) — the SAME source and math as the PURE column and gex.js's slFrac.
+// Returns 1 (no haircut) when STRIP_MULTILEG is off or the cell has no recorded volume yet.
+function singleLegFrac(sym, cellKey) {
+  if (!STRIP_MULTILEG) return 1;
+  const pm = purAcc[SPOT_ALIAS[sym] || sym]; if (!pm) return 1;
+  const cc = pm.get(cellKey + '|C'), pp = pm.get(cellKey + '|P');
+  const vv = (cc ? cc.vol : 0) + (pp ? pp.vol : 0);
+  const mm = (cc ? cc.ml  : 0) + (pp ? pp.ml  : 0);
+  return vv > 0 ? Math.max(0, Math.min(1, 1 - mm / vv)) : 1;
+}
 function assembleGrid(sym, expCsv) {
   const st = state[sym] || { spot: 0, ts: 0, cells: new Map() };
   const spot = st.spot;
@@ -136,7 +158,9 @@ function assembleGrid(sym, expCsv) {
     .sort((a, b) => b - a);
 
   const cell = (k, e) => st.cells.get(`${k}|${e}`) || null;
-  const gex   = strikes.map(k => expRows.map(er => { const c = cell(k, er.date); return c ? c.flow : 0; }));
+  // M2: haircut FLOW by the per-cell single-leg fraction (shared singleLegFrac, same source as the
+  // PURE column). Only FLOW is stripped; standing/vanna are OI-based. Unknown cell => no haircut.
+  const gex   = strikes.map(k => expRows.map(er => { const c = cell(k, er.date); return c ? c.flow * singleLegFrac(sym, `${k}|${er.date}`) : 0; }));
   const naive = strikes.map(k => expRows.map(er => { const c = cell(k, er.date); return c ? c.standing : 0; }));
   const vanna = strikes.map(k => expRows.map(er => { const c = cell(k, er.date); return c ? c.vanna : 0; }));
 
@@ -191,7 +215,7 @@ function assembleGrid(sym, expCsv) {
 const b64url = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const hsign  = (p, s) => b64url(crypto.createHmac('sha256', s).update(p).digest());
 function verifyToken(tok) {
-  if (!SESSION_SECRET) return { u: 'dev' };               // dev: open
+  if (!SESSION_SECRET) return ALLOW_OPEN_AUTH ? { u: 'dev' } : null;   // M1: prod fails CLOSED; open only with explicit ALLOW_OPEN_AUTH=1
   if (!tok || tok.indexOf('.') < 0) return null;
   const [p, sig] = tok.split('.'); const ex = hsign(p, SESSION_SECRET);
   if (!sig || sig.length !== ex.length) return null;
@@ -321,7 +345,7 @@ setInterval(() => {
   const t = Date.now();
   for (const sym of Object.keys(state)) {
     const st = state[sym]; if (!st.cells.size) continue;
-    const gex = {}; for (const [k, v] of st.cells) gex[k] = v.flow;
+    const gex = {}; for (const [k, v] of st.cells) gex[k] = v.flow * singleLegFrac(sym, k);   // M2: same single-leg haircut as the live grid, so ROC%/momentum stays on one scale
     const arr = momHist[sym] || (momHist[sym] = []);
     arr.push({ t, gex });
     const cut = t - HIST_KEEP_MS;
