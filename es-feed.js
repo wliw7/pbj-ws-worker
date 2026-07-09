@@ -103,12 +103,18 @@ function mount(app, opts) {
   function etNow() {
     const p = new Intl.DateTimeFormat('en-US', {
       timeZone: 'America/New_York', year: 'numeric', month: '2-digit',
-      day: '2-digit', hour: '2-digit', hour12: false,
+      day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
     }).formatToParts(new Date());
     const o = {}; for (const x of p) o[x.type] = x.value;
-    return { d: `${o.year}-${o.month}-${o.day}`, h: +o.hour };
+    return { d: `${o.year}-${o.month}-${o.day}`, h: +o.hour, m: +o.minute };
   }
   function sessionDate() { const t = etNow(); return t.h >= 18 ? t.d + '+1' : t.d; }
+  // epoch ms of the current Globex session's open (the most recent 18:00 ET)
+  function sessionStartMs() {
+    const t = etNow();
+    const minsSinceOpen = ((t.h >= 18 ? t.h - 18 : t.h + 6) * 60) + t.m;
+    return Date.now() - minsSinceOpen * 60000 - (Date.now() % 60000);
+  }
   function resetSession() {
     S.cvd = 0; S.bigCvd = 0; S.vol = 0; S.buyVol = 0; S.sellVol = 0;
     S.ladder.clear(); S.recent = []; S.bars = [];
@@ -295,13 +301,17 @@ function mount(app, opts) {
         [S.ticker, S.sessionDate, JSON.stringify(data)]);
     } catch (e) { console.warn('[es-feed] store save failed:', e.message); }
   }
-  // Backfill the restart gap from REST history. Tick-rule side classification.
-  async function backfillGap(sinceMs) {
+  // Backfill from REST history — restart gaps (few pages) OR, on the first boot of
+  // a session with nothing saved, the ENTIRE session so far (up to ~2M prints; they
+  // fold into the ladder/counters and only the last RECENT_MAX stay in the ring).
+  // Tick-rule side classification (history carries no BBO); live tape stays BBO-classified.
+  async function backfillGap(sinceMs, maxPages) {
     if (!(sinceMs > 0)) return;
+    maxPages = maxPages || 6;
     try {
-      let path = `/futures/v1/trades/${encodeURIComponent(S.ticker)}?timestamp.gt=${Math.floor(sinceMs * 1e6)}&sort=timestamp.asc&limit=5000`;
+      let path = `/futures/v1/trades/${encodeURIComponent(S.ticker)}?timestamp.gt=${Math.floor(sinceMs * 1e6)}&sort=timestamp.asc&limit=49999`;
       let pages = 0, prev = S.last || 0, n = 0;
-      while (path && pages < 6) {
+      while (path && pages < maxPages) {
         const j = await mget(path);
         const rows = (j && j.results) || [];
         for (const r of rows) {
@@ -315,7 +325,7 @@ function mount(app, opts) {
         pages++;
         if (!rows.length) break;
       }
-      if (n) console.log(`[es-feed] backfilled ${n} trades from REST (downtime gap)`);
+      if (n) console.log(`[es-feed] backfilled ${n.toLocaleString()} trades from REST (${pages} pages)`);
     } catch (e) { console.warn('[es-feed] backfill failed:', e.message); }
   }
   setInterval(storeSave, SAVE_MS);
@@ -416,10 +426,18 @@ function mount(app, opts) {
     S.sessionDate = sessionDate();
     try { await resolveTicker(); } catch (e) { console.error('[es-feed] ticker resolve failed:', e.message); S.ticker = S.ticker || 'ES?'; }
     await fetchAnchor();
-    // restore this session's state (if any), then backfill the restart gap from REST
+    // restore this session's state (if any), then backfill from REST:
+    //   saved state  -> just the restart gap (quick)
+    //   nothing saved -> the WHOLE session so far, so the ladder/CVD are complete
+    //                    from the Globex open even on the very first boot
     await storeInit();
     const saved = await storeLoad();
-    if (saved && restoreState(saved) && S.lastT > 0) await backfillGap(S.lastT);
+    if (saved && restoreState(saved) && S.lastT > 0) {
+      await backfillGap(S.lastT);
+    } else if (process.env.ES_BACKFILL !== '0') {
+      console.log('[es-feed] no saved state this session — backfilling from the Globex open…');
+      await backfillGap(sessionStartMs(), 60);
+    }
     connect();
   })();
 
