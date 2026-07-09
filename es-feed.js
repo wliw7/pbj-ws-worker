@@ -119,7 +119,8 @@ function mount(app, opts) {
     S.cvd = 0; S.bigCvd = 0; S.vol = 0; S.buyVol = 0; S.sellVol = 0;
     S.ladder.clear(); S.recent = []; S.bars = [];
     S.sessionDate = sessionDate();
-    storeDirty = true;   // persist the fresh session row immediately
+    S.from = Date.now();           // when this accumulation began (for head-gap detection)
+    storeDirty = true;             // persist the fresh session row immediately
     console.log('[es-feed] session reset →', S.sessionDate);
   }
 
@@ -207,9 +208,23 @@ function mount(app, opts) {
     return 0;
   }
   // Core accumulation, shared by the live socket (d from BBO) and the REST gap
-  // backfill (d from tick rule). `live` controls whether the print fans out to SSE.
-  function applyTrade(p, s, t, d, live) {
+  // backfill (d from tick rule). `live` controls SSE fan-out; `noRing` keeps
+  // out-of-order HEAD backfills (older than what we hold) off the ring/bars —
+  // ladder and counters are order-insensitive sums, so those always apply.
+  function applyTrade(p, s, t, d, live, noRing) {
     if (S.sessionDate !== sessionDate()) resetSession();
+    if (noRing) {
+      S.vol += s;
+      if (d > 0) { S.cvd += s; S.buyVol += s; if (s >= BIG_SIZE) S.bigCvd += s; }
+      else if (d < 0) { S.cvd -= s; S.sellVol += s; if (s >= BIG_SIZE) S.bigCvd -= s; }
+      const k0 = p.toFixed(2);
+      let L0 = S.ladder.get(k0);
+      if (!L0) { L0 = { b: 0, s: 0, v: 0 }; S.ladder.set(k0, L0); }
+      if (d > 0) L0.b += s; else if (d < 0) L0.s += s;
+      L0.v += s;
+      storeDirty = true;
+      return;
+    }
     S.last = p; S.lastT = t;
     S.vol += s;
     if (d > 0) { S.cvd += s; S.buyVol += s; if (s >= BIG_SIZE) S.bigCvd += s; }
@@ -279,6 +294,7 @@ function mount(app, opts) {
       S.cvd = num(d.cvd); S.bigCvd = num(d.bigCvd); S.vol = num(d.vol);
       S.buyVol = num(d.buyVol); S.sellVol = num(d.sellVol);
       S.last = num(d.last) || 0; S.lastT = num(d.lastT) || 0;
+      S.from = num(d.from) || 0;   // 0 = legacy row (pre-v3.2) — coverage start unknown
       S.ladder = new Map((d.ladder || []).map(r => [(+r[0]).toFixed(2), { b: num(r[1]), s: num(r[2]), v: num(r[3]) }]));
       S.recent = Array.isArray(d.recent) ? d.recent.slice(-RECENT_MAX) : [];
       console.log(`[es-feed] restored session ${S.sessionDate}: vol ${S.vol}, cvd ${S.cvd}, ladder ${S.ladder.size} px, ring ${S.recent.length}`);
@@ -290,7 +306,7 @@ function mount(app, opts) {
     storeDirty = false;
     const data = {
       cvd: S.cvd, bigCvd: S.bigCvd, vol: S.vol, buyVol: S.buyVol, sellVol: S.sellVol,
-      last: S.last, lastT: S.lastT,
+      last: S.last, lastT: S.lastT, from: S.from || 0,
       ladder: [...S.ladder].map(([k, v]) => [+k, v.b, v.s, v.v]),
       recent: S.recent.slice(-RECENT_MAX),
     };
@@ -305,11 +321,13 @@ function mount(app, opts) {
   // a session with nothing saved, the ENTIRE session so far (up to ~2M prints; they
   // fold into the ladder/counters and only the last RECENT_MAX stay in the ring).
   // Tick-rule side classification (history carries no BBO); live tape stays BBO-classified.
-  async function backfillGap(sinceMs, maxPages) {
+  async function backfillGap(sinceMs, maxPages, untilMs, noRing) {
     if (!(sinceMs > 0)) return;
     maxPages = maxPages || 6;
     try {
-      let path = `/futures/v1/trades/${encodeURIComponent(S.ticker)}?timestamp.gt=${Math.floor(sinceMs * 1e6)}&sort=timestamp.asc&limit=49999`;
+      let path = `/futures/v1/trades/${encodeURIComponent(S.ticker)}?timestamp.gt=${Math.floor(sinceMs * 1e6)}`
+        + (untilMs > 0 ? `&timestamp.lt=${Math.floor(untilMs * 1e6)}` : '')
+        + `&sort=timestamp.asc&limit=49999`;
       let pages = 0, prev = S.last || 0, n = 0;
       while (path && pages < maxPages) {
         const j = await mget(path);
@@ -318,14 +336,14 @@ function mount(app, opts) {
           const p = num(r.price), s = num(r.size), t = Math.round(num(r.timestamp) / 1e6);
           if (!(p > 0 && s > 0)) continue;
           const d = prev > 0 ? (p > prev ? 1 : (p < prev ? -1 : 0)) : 0;
-          applyTrade(p, s, t, d, false);
+          applyTrade(p, s, t, d, false, !!noRing);
           prev = p; n++;
         }
         path = (j && j.next_url) ? String(j.next_url).replace(API, '') : null;
         pages++;
         if (!rows.length) break;
       }
-      if (n) console.log(`[es-feed] backfilled ${n.toLocaleString()} trades from REST (${pages} pages)`);
+      if (n) console.log(`[es-feed] backfilled ${n.toLocaleString()} trades from REST (${pages} pages${noRing ? ', head — ladder/counters only' : ''})`);
     } catch (e) { console.warn('[es-feed] backfill failed:', e.message); }
   }
   setInterval(storeSave, SAVE_MS);
@@ -426,17 +444,30 @@ function mount(app, opts) {
     S.sessionDate = sessionDate();
     try { await resolveTicker(); } catch (e) { console.error('[es-feed] ticker resolve failed:', e.message); S.ticker = S.ticker || 'ES?'; }
     await fetchAnchor();
-    // restore this session's state (if any), then backfill from REST:
-    //   saved state  -> just the restart gap (quick)
-    //   nothing saved -> the WHOLE session so far, so the ladder/CVD are complete
-    //                    from the Globex open even on the very first boot
+    // restore this session's state (if any), then make coverage COMPLETE from the
+    // Globex open via REST:
+    //   saved state, full coverage    -> backfill just the restart gap (quick)
+    //   saved state, started mid-day  -> ALSO backfill the missing head
+    //                                    (ladder/counters only — order-insensitive)
+    //   nothing saved / ES_REBUILD=1  -> rebuild the whole session from the open
     await storeInit();
-    const saved = await storeLoad();
-    if (saved && restoreState(saved) && S.lastT > 0) {
-      await backfillGap(S.lastT);
+    let saved = process.env.ES_REBUILD === '1' ? null : await storeLoad();
+    // a legacy row (saved before coverage tracking) can't be safely head-filled
+    // without double counting — rebuild it from REST instead (one-time cost)
+    if (saved && !num(saved.from)) { console.log('[es-feed] saved state has no coverage info — rebuilding instead'); saved = null; }
+    const sStart = sessionStartMs();
+    if (saved && restoreState(saved)) {
+      if (process.env.ES_BACKFILL !== '0' && S.from - sStart > 120000) {
+        console.log('[es-feed] saved state starts mid-session — backfilling the missing head…');
+        await backfillGap(sStart, 60, S.from, true);   // ladder/counters only, bounded at coverage start
+        S.from = sStart;
+      }
+      if (S.lastT > 0) await backfillGap(S.lastT, 6);
     } else if (process.env.ES_BACKFILL !== '0') {
-      console.log('[es-feed] no saved state this session — backfilling from the Globex open…');
-      await backfillGap(sessionStartMs(), 60);
+      resetSession();
+      console.log('[es-feed] rebuilding this session from the Globex open…');
+      await backfillGap(sStart, 60);
+      S.from = sStart;
     }
     connect();
   })();
