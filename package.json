@@ -1,15 +1,19 @@
 {
-  "name": "autumn-es-worker",
+  "name": "pbj-gex-ws-worker",
   "version": "1.0.0",
-  "description": "Autumn — ES futures orderflow relay (Massive.com feed). Founder-only.",
+  "private": true,
+  "description": "PBJ Capital \u2014 single UW WebSocket consumer that fans out the live GEX grid to many dashboard users (decouples UW API load from user count).",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "ws": "^8.17.0"
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "ws": "^8.18.0"
   }
 }
