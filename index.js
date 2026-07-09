@@ -237,6 +237,7 @@ function auth(req, res, next) {
 // ---- HTTP / SSE ------------------------------------------------------------
 const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',').map(s => s.trim()), credentials: true }));
+require('./es-feed').mount(app, { verifyToken });   // ES tape for the Edge level radar (founder-only; needs MASSIVE_KEY)
 
 const sse = {};   // sym -> Map(res -> expCsv)
 
