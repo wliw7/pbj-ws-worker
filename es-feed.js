@@ -1,0 +1,319 @@
+'use strict';
+// ---------------------------------------------------------------------------
+// Autumn — ES futures tape feed (Massive.com) for the Edge "level radar".
+//
+// DROP-IN MODULE FOR THE RAILWAY WORKER (pbj-ws-worker). This file lives in the
+// site repo under netlify/worker/ (never served — /netlify/* is 404'd by
+// netlify.toml). Copy it into the worker repo next to index.js and wire it:
+//
+//   // index.js — after `const app = express()` and verifyToken are defined:
+//   require('./es-feed').mount(app, { verifyToken });
+//
+//   ENV (Railway):
+//     MASSIVE_KEY   required — Massive.com API key (Futures Advanced plan)
+//     ES_PRODUCT    default "ES"    (product_code for front-month discovery)
+//     ES_TICKER     optional        hard override, e.g. "ESU6" (skips discovery)
+//     MASSIVE_WS    default "wss://socket.massive.com/futures"
+//     ES_BIG_SIZE   default 20      contracts; prints >= this feed the "big" CVD
+//
+// WHY THE WORKER: one Massive socket serves every founder session, the key
+// never reaches a browser, and the SSE fan-out + ticket auth mirror /stream.
+//
+// Protocol (confirmed against massive.com docs + official client):
+//   connect  wss://socket.massive.com/futures
+//   auth     {"action":"auth","params":"<KEY>"}
+//   sub      {"action":"subscribe","params":"T.ESU6,Q.ESU6"}
+//   trade    {ev:"T", sym, p, s, t(ms), q}      quote {ev:"Q", sym, bp, bs, ap, as, t}
+//   Messages arrive as JSON ARRAYS. ev:"status" frames carry auth/sub acks.
+//
+// PRICE-SCALE GUARD: Massive's WS docs sample shows p=606450 for ESZ4 (i.e.
+// price*100) while REST /futures/v1/trades returns 6052.00. We anchor against
+// one REST last-trade at boot and derive a /1 or /100 divisor per field, so the
+// feed is correct whichever encoding the socket actually emits.
+//
+// Endpoints (mounted on the existing express app):
+//   GET /es/health           no auth — socket/tape liveness + ticker + scale
+//   GET /es/state?s=<t>      founder ticket — engine snapshot (ladder/CVD/session)
+//   GET /es/stream?s=<t>     founder ticket — SSE: init snapshot, then ~4/s batches
+//
+// FOUNDER-ONLY: tickets are minted by ws-ticket.js which now carries the role
+// claim (r:"admin"). Members' tickets lack it -> 403. Licensed data must not
+// fan out to members without a redistribution agreement.
+// ---------------------------------------------------------------------------
+
+const WebSocket = require('ws');
+
+const API = 'https://api.massive.com';
+
+function num(x) { const n = parseFloat(x); return Number.isFinite(n) ? n : 0; }
+
+function mount(app, opts) {
+  opts = opts || {};
+  const verifyToken = opts.verifyToken;
+  if (typeof verifyToken !== 'function') throw new Error('es-feed: pass { verifyToken } from index.js');
+
+  const KEY        = (process.env.MASSIVE_KEY || '').trim();
+  const PRODUCT    = (process.env.ES_PRODUCT || 'ES').trim().toUpperCase();
+  const WS_URL     = (process.env.MASSIVE_WS || 'wss://socket.massive.com/futures').trim();
+  const BIG_SIZE   = parseInt(process.env.ES_BIG_SIZE || '20', 10);
+  const MIN_DTM    = 3;            // roll: skip contracts within 3 days of last trade
+  const RECENT_MAX = 400;          // prints replayed to a fresh client
+  const FLUSH_MS   = 250;          // SSE batch cadence
+  const BAR_MS     = 1000;         // 1s bars ring (burst z-score source, client-side)
+  const BARS_KEEP  = 900;          // 15 min of 1s bars
+
+  if (!KEY) { console.warn('[es-feed] MASSIVE_KEY not set — ES feed disabled'); }
+
+  // ---- auth: founder-only (ticket must carry r:"admin"; see ws-ticket.js) ---
+  function founder(req, res, next) {
+    const tok = req.query.s
+      || req.headers['x-pbj-session']
+      || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const sess = verifyToken(tok);
+    if (!sess) return res.status(401).json({ error: 'unauthorized' });
+    if (sess.r !== 'admin' && sess.u !== 'dev') return res.status(403).json({ error: 'founder only' });
+    req.sess = sess; next();
+  }
+
+  // ---- live state -----------------------------------------------------------
+  const S = {
+    ticker: (process.env.ES_TICKER || '').trim().toUpperCase() || null,
+    discovered: null,            // { ticker, last_trade_date, tick }
+    sockStatus: 'idle',
+    lastMsg: 0,
+    scaleT: 0,                   // divisor for trade prices: 0 = not yet inferred
+    scaleQ: 0,                   // divisor for quote prices
+    anchor: 0,                   // REST last-trade price (decimal) used to infer scale
+    // tape
+    bid: 0, ask: 0, bs: 0, as: 0, qt: 0,
+    last: 0, lastT: 0,
+    cvd: 0, bigCvd: 0, vol: 0, buyVol: 0, sellVol: 0,
+    sessionDate: null,           // ET trading date (18:00 ET boundary)
+    ladder: new Map(),           // priceKey -> { b, s, v }  (0.25-pt native buckets)
+    recent: [],                  // [{t,p,s,d,bp,ap}] ring, newest last
+    bars: [],                    // 1s bars ring [{t,o,h,l,c,v,d}]
+  };
+  const clients = new Set();     // SSE responses
+  let pending = [];              // trades since last flush
+
+  // ---- session boundary: Globex day rolls at 18:00 ET -----------------------
+  function etNow() {
+    const p = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', year: 'numeric', month: '2-digit',
+      day: '2-digit', hour: '2-digit', hour12: false,
+    }).formatToParts(new Date());
+    const o = {}; for (const x of p) o[x.type] = x.value;
+    return { d: `${o.year}-${o.month}-${o.day}`, h: +o.hour };
+  }
+  function sessionDate() { const t = etNow(); return t.h >= 18 ? t.d + '+1' : t.d; }
+  function resetSession() {
+    S.cvd = 0; S.bigCvd = 0; S.vol = 0; S.buyVol = 0; S.sellVol = 0;
+    S.ladder.clear(); S.recent = []; S.bars = [];
+    S.sessionDate = sessionDate();
+    console.log('[es-feed] session reset →', S.sessionDate);
+  }
+
+  // ---- REST helpers ----------------------------------------------------------
+  async function mget(path) {
+    const r = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${KEY}`, Accept: 'application/json' } });
+    const j = await r.json().catch(() => null);
+    if (!r.ok) throw new Error((j && (j.error || j.message)) || `massive HTTP ${r.status}`);
+    return j;
+  }
+
+  // Front month: active single contracts for the product, nearest last_trade_date
+  // that is at least MIN_DTM days out (avoids the roll edge). ES_TICKER overrides.
+  async function resolveTicker() {
+    if (process.env.ES_TICKER) { S.ticker = process.env.ES_TICKER.trim().toUpperCase(); return S.ticker; }
+    const j = await mget(`/futures/v1/contracts?product_code=${encodeURIComponent(PRODUCT)}&active=true&type=single&sort=last_trade_date.asc&limit=20`);
+    const rows = (j && j.results) || [];
+    const now = Date.now();
+    for (const c of rows) {
+      if (!c.ticker || !c.last_trade_date) continue;
+      const dtm = (new Date(c.last_trade_date + 'T21:00:00Z') - now) / 864e5;
+      if (dtm >= MIN_DTM) {
+        if (S.ticker !== c.ticker) console.log('[es-feed] front month →', c.ticker, '(last trade', c.last_trade_date + ')');
+        S.discovered = { ticker: c.ticker, last_trade_date: c.last_trade_date, tick: num(c.trade_tick_size) || 0.25 };
+        return (S.ticker = c.ticker);
+      }
+    }
+    throw new Error(`no active ${PRODUCT} contract found`);
+  }
+
+  // One REST last-trade → decimal price anchor for the WS scale inference.
+  async function fetchAnchor() {
+    try {
+      const j = await mget(`/futures/v1/trades/${encodeURIComponent(S.ticker)}?limit=1&sort=timestamp.desc`);
+      const p = num(j && j.results && j.results[0] && j.results[0].price);
+      if (p > 0) { S.anchor = p; console.log('[es-feed] anchor', S.ticker, '=', p); }
+    } catch (e) { console.warn('[es-feed] anchor fetch failed:', e.message); }
+  }
+  // Infer /1 vs /100 (vs /1000 just in case) against the anchor, once per field kind.
+  function inferScale(raw) {
+    if (!(raw > 0)) return 0;
+    if (!(S.anchor > 0)) return 1;                       // no anchor — trust as-is
+    let best = 1, bd = Infinity;
+    for (const d of [1, 100, 1000]) {
+      const diff = Math.abs(raw / d - S.anchor) / S.anchor;
+      if (diff < bd) { bd = diff; best = d; }
+    }
+    return bd <= 0.2 ? best : 1;                          // within ±20% of anchor
+  }
+  const scaleTrade = (p) => { if (!S.scaleT) { S.scaleT = inferScale(p); if (S.scaleT !== 1) console.log('[es-feed] trade price divisor', S.scaleT); } return p / (S.scaleT || 1); };
+  const scaleQuote = (p) => { if (!S.scaleQ) { S.scaleQ = inferScale(p); if (S.scaleQ !== 1) console.log('[es-feed] quote price divisor', S.scaleQ); } return p / (S.scaleQ || 1); };
+
+  // ---- tape engine -----------------------------------------------------------
+  function onQuote(m) {
+    const bp = scaleQuote(num(m.bp)), ap = scaleQuote(num(m.ap));
+    if (bp > 0) { S.bid = bp; S.bs = num(m.bs); }
+    if (ap > 0) { S.ask = ap; S.as = num(m.as); }
+    S.qt = num(m.t) || Date.now();
+    S.lastMsg = Date.now();
+  }
+  function classify(p) {
+    // aggressor vs prevailing BBO: at/above ask = buy (+1), at/below bid = sell (-1),
+    // inside spread leans by midpoint, dead-center = 0.
+    if (S.ask > 0 && p >= S.ask) return 1;
+    if (S.bid > 0 && p <= S.bid) return -1;
+    if (S.bid > 0 && S.ask > S.bid) {
+      const mid = (S.bid + S.ask) / 2;
+      if (p > mid) return 1;
+      if (p < mid) return -1;
+    }
+    return 0;
+  }
+  function onTrade(m) {
+    const p = scaleTrade(num(m.p)); if (!(p > 0)) return;
+    const s = num(m.s) || 0; if (!(s > 0)) return;
+    const t = num(m.t) || Date.now();
+    if (S.sessionDate !== sessionDate()) resetSession();
+    const d = classify(p);
+    S.last = p; S.lastT = t; S.lastMsg = Date.now();
+    S.vol += s;
+    if (d > 0) { S.cvd += s; S.buyVol += s; if (s >= BIG_SIZE) S.bigCvd += s; }
+    else if (d < 0) { S.cvd -= s; S.sellVol += s; if (s >= BIG_SIZE) S.bigCvd -= s; }
+    // ladder at native tick buckets
+    const key = p.toFixed(2);
+    let L = S.ladder.get(key);
+    if (!L) { L = { b: 0, s: 0, v: 0 }; S.ladder.set(key, L); }
+    if (d > 0) L.b += s; else if (d < 0) L.s += s;
+    L.v += s;
+    // 1s bars
+    const bt = Math.floor(t / BAR_MS) * BAR_MS;
+    let bar = S.bars[S.bars.length - 1];
+    if (!bar || bar.t !== bt) {
+      bar = { t: bt, o: p, h: p, l: p, c: p, v: 0, d: 0 };
+      S.bars.push(bar);
+      while (S.bars.length > BARS_KEEP) S.bars.shift();
+    }
+    if (p > bar.h) bar.h = p; if (p < bar.l) bar.l = p;
+    bar.c = p; bar.v += s; bar.d += d * s;
+    // rings + SSE batch
+    const row = { t, p, s, d, bp: S.bid, ap: S.ask, bs: S.bs, as: S.as };
+    S.recent.push(row); while (S.recent.length > RECENT_MAX) S.recent.shift();
+    pending.push(row);
+  }
+
+  // ---- Massive socket --------------------------------------------------------
+  let ws = null, wsTries = 0, subbed = '';
+  function subscribe() {
+    if (!ws || ws.readyState !== 1 || !S.ticker) return;
+    const want = `T.${S.ticker},Q.${S.ticker}`;
+    if (subbed && subbed !== want) { try { ws.send(JSON.stringify({ action: 'unsubscribe', params: subbed })); } catch {} }
+    try { ws.send(JSON.stringify({ action: 'subscribe', params: want })); subbed = want; console.log('[es-feed] subscribe', want); } catch {}
+  }
+  function connect() {
+    if (!KEY) return;
+    S.sockStatus = 'connecting';
+    console.log('[es-feed] connect →', WS_URL);
+    ws = new WebSocket(WS_URL);
+    ws.on('open', () => { S.sockStatus = 'open'; wsTries = 0; try { ws.send(JSON.stringify({ action: 'auth', params: KEY })); } catch {} });
+    ws.on('message', (buf) => {
+      let arr; try { arr = JSON.parse(buf.toString()); } catch { return; }
+      if (!Array.isArray(arr)) arr = [arr];
+      for (const m of arr) {
+        if (!m || typeof m !== 'object') continue;
+        if (m.ev === 'status') {
+          const st = String(m.status || '');
+          if (st === 'auth_success') { console.log('[es-feed] auth ok'); subscribe(); }
+          else if (st === 'auth_failed') { console.error('[es-feed] AUTH FAILED:', m.message); S.sockStatus = 'auth_failed'; }
+          else if (m.message) console.log('[es-feed] status:', m.message);
+          continue;
+        }
+        if (m.ev === 'Q') onQuote(m);
+        else if (m.ev === 'T') onTrade(m);
+      }
+    });
+    ws.on('error', (e) => { S.sockStatus = 'error'; console.error('[es-feed] ws error', (e && e.message) || e); });
+    ws.on('close', () => {
+      S.sockStatus = 'closed'; subbed = '';
+      const delay = [1000, 2000, 5000, 10000][wsTries++] || 15000;
+      setTimeout(connect, delay);
+    });
+  }
+
+  // roll check: re-resolve the front month once an hour; resubscribe on change.
+  setInterval(async () => {
+    if (!KEY || process.env.ES_TICKER) return;
+    const prev = S.ticker;
+    try { await resolveTicker(); } catch { return; }
+    if (prev !== S.ticker) { S.scaleT = 0; S.scaleQ = 0; await fetchAnchor(); resetSession(); subscribe(); }
+  }, 3600_000);
+
+  // ---- SSE fan-out -----------------------------------------------------------
+  function snapshot() {
+    const ladder = [];
+    for (const [k, v] of S.ladder) ladder.push([+k, v.b, v.s]);
+    ladder.sort((a, b) => b[0] - a[0]);
+    return {
+      type: 'init', ticker: S.ticker, session: S.sessionDate,
+      last: S.last, bid: S.bid, ask: S.ask, bs: S.bs, as: S.as,
+      cvd: S.cvd, bigCvd: S.bigCvd, vol: S.vol, buyVol: S.buyVol, sellVol: S.sellVol,
+      bigSize: BIG_SIZE, ladder, recent: S.recent.slice(-RECENT_MAX),
+    };
+  }
+  setInterval(() => {
+    if (!pending.length || !clients.size) { pending = []; return; }
+    const payload = `data: ${JSON.stringify({
+      type: 'tape', trades: pending,
+      cvd: S.cvd, bigCvd: S.bigCvd, vol: S.vol,
+      bid: S.bid, ask: S.ask, bs: S.bs, as: S.as, last: S.last,
+    })}\n\n`;
+    pending = [];
+    for (const res of clients) { try { res.write(payload); } catch {} }
+  }, FLUSH_MS);
+
+  // ---- routes -----------------------------------------------------------------
+  app.get('/es/health', (_req, res) => {
+    res.json({
+      ok: true, enabled: !!KEY, socket: S.sockStatus, ticker: S.ticker,
+      session: S.sessionDate, lastMsgAgeMs: S.lastMsg ? Date.now() - S.lastMsg : null,
+      last: S.last, bid: S.bid, ask: S.ask,
+      scale: { trade: S.scaleT || null, quote: S.scaleQ || null, anchor: S.anchor || null },
+      vol: S.vol, cvd: S.cvd, bigCvd: S.bigCvd, viewers: clients.size,
+    });
+  });
+  app.get('/es/state', founder, (_req, res) => { res.set('Cache-Control', 'no-store'); res.json(snapshot()); });
+  app.get('/es/stream', founder, (req, res) => {
+    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders && res.flushHeaders();
+    res.write('retry: 3000\n\n');
+    res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
+    clients.add(res);
+    const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+    req.on('close', () => { clearInterval(ping); clients.delete(res); });
+  });
+
+  // ---- boot -------------------------------------------------------------------
+  (async () => {
+    if (!KEY) return;
+    S.sessionDate = sessionDate();
+    try { await resolveTicker(); } catch (e) { console.error('[es-feed] ticker resolve failed:', e.message); S.ticker = S.ticker || 'ES?'; }
+    await fetchAnchor();
+    connect();
+  })();
+
+  console.log('[es-feed] mounted — /es/health /es/state /es/stream');
+}
+
+module.exports = { mount };
