@@ -57,10 +57,13 @@ function mount(app, opts) {
   const WS_URL     = (process.env.MASSIVE_WS || 'wss://socket.massive.com/futures').trim();
   const BIG_SIZE   = parseInt(process.env.ES_BIG_SIZE || '20', 10);
   const MIN_DTM    = 3;            // roll: skip contracts within 3 days of last trade
-  const RECENT_MAX = 400;          // prints replayed to a fresh client
+  // v3: ring big enough that a page refresh reconstructs the FULL 3-minute band
+  // window instantly, even on fast tape (~3k prints ≈ several minutes of ES).
+  const RECENT_MAX = parseInt(process.env.ES_RECENT || '3000', 10);
   const FLUSH_MS   = 250;          // SSE batch cadence
   const BAR_MS     = 1000;         // 1s bars ring (burst z-score source, client-side)
   const BARS_KEEP  = 900;          // 15 min of 1s bars
+  const SAVE_MS    = 5000;         // session-state persistence cadence (Postgres)
 
   if (!KEY) { console.warn('[es-feed] MASSIVE_KEY not set — ES feed disabled'); }
 
@@ -110,6 +113,7 @@ function mount(app, opts) {
     S.cvd = 0; S.bigCvd = 0; S.vol = 0; S.buyVol = 0; S.sellVol = 0;
     S.ladder.clear(); S.recent = []; S.bars = [];
     S.sessionDate = sessionDate();
+    storeDirty = true;   // persist the fresh session row immediately
     console.log('[es-feed] session reset →', S.sessionDate);
   }
 
@@ -196,13 +200,11 @@ function mount(app, opts) {
     }
     return 0;
   }
-  function onTrade(m) {
-    const p = scaleTrade(num(m.p)); if (!(p > 0)) return;
-    const s = num(m.s) || 0; if (!(s > 0)) return;
-    const t = num(m.t) || Date.now();
+  // Core accumulation, shared by the live socket (d from BBO) and the REST gap
+  // backfill (d from tick rule). `live` controls whether the print fans out to SSE.
+  function applyTrade(p, s, t, d, live) {
     if (S.sessionDate !== sessionDate()) resetSession();
-    const d = classify(p);
-    S.last = p; S.lastT = t; S.lastMsg = Date.now();
+    S.last = p; S.lastT = t;
     S.vol += s;
     if (d > 0) { S.cvd += s; S.buyVol += s; if (s >= BIG_SIZE) S.bigCvd += s; }
     else if (d < 0) { S.cvd -= s; S.sellVol += s; if (s >= BIG_SIZE) S.bigCvd -= s; }
@@ -225,8 +227,98 @@ function mount(app, opts) {
     // rings + SSE batch
     const row = { t, p, s, d, bp: S.bid, ap: S.ask, bs: S.bs, as: S.as };
     S.recent.push(row); while (S.recent.length > RECENT_MAX) S.recent.shift();
-    pending.push(row);
+    if (live) pending.push(row);
+    storeDirty = true;
   }
+  function onTrade(m) {
+    const p = scaleTrade(num(m.p)); if (!(p > 0)) return;
+    const s = num(m.s) || 0; if (!(s > 0)) return;
+    const t = num(m.t) || Date.now();
+    S.lastMsg = Date.now();
+    applyTrade(p, s, t, classify(p), true);
+  }
+
+  // ---- session persistence (Postgres, optional) + REST gap backfill ----------
+  // Counters/ladder/ring survive worker restarts, so CVD really runs from the
+  // Globex open. On boot with saved state from the SAME session, the downtime gap
+  // is backfilled from Massive's REST trades (tick-rule classified — no BBO in
+  // history; gaps are ~a minute, so the approximation is immaterial).
+  let pgPool = null, storeDirty = false;
+  function initStore() {
+    const url = (process.env.DATABASE_URL || '').trim();
+    if (!url) { console.log('[es-feed] DATABASE_URL not set — session persistence OFF'); return false; }
+    let Pool; try { ({ Pool } = require('pg')); } catch { console.warn('[es-feed] "pg" missing — session persistence OFF'); return false; }
+    pgPool = new Pool({ connectionString: url, max: 2 });
+    pgPool.on('error', (e) => console.warn('[es-feed] pg pool error:', e.message));
+    return true;
+  }
+  async function storeInit() {
+    if (!initStore()) return;
+    try {
+      await pgPool.query(`CREATE TABLE IF NOT EXISTS es_session (
+        ticker text NOT NULL, session text NOT NULL, data jsonb NOT NULL,
+        updated timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (ticker, session))`);
+      await pgPool.query(`DELETE FROM es_session WHERE updated < now() - interval '3 days'`);
+    } catch (e) { console.warn('[es-feed] store init failed:', e.message); pgPool = null; }
+  }
+  async function storeLoad() {
+    if (!pgPool || !S.ticker) return null;
+    try {
+      const r = await pgPool.query(`SELECT data FROM es_session WHERE ticker=$1 AND session=$2`, [S.ticker, S.sessionDate]);
+      return (r.rows && r.rows[0] && r.rows[0].data) || null;
+    } catch (e) { console.warn('[es-feed] store load failed:', e.message); return null; }
+  }
+  function restoreState(d) {
+    try {
+      S.cvd = num(d.cvd); S.bigCvd = num(d.bigCvd); S.vol = num(d.vol);
+      S.buyVol = num(d.buyVol); S.sellVol = num(d.sellVol);
+      S.last = num(d.last) || 0; S.lastT = num(d.lastT) || 0;
+      S.ladder = new Map((d.ladder || []).map(r => [(+r[0]).toFixed(2), { b: num(r[1]), s: num(r[2]), v: num(r[3]) }]));
+      S.recent = Array.isArray(d.recent) ? d.recent.slice(-RECENT_MAX) : [];
+      console.log(`[es-feed] restored session ${S.sessionDate}: vol ${S.vol}, cvd ${S.cvd}, ladder ${S.ladder.size} px, ring ${S.recent.length}`);
+      return true;
+    } catch (e) { console.warn('[es-feed] restore failed:', e.message); return false; }
+  }
+  async function storeSave() {
+    if (!pgPool || !S.ticker || !storeDirty) return;
+    storeDirty = false;
+    const data = {
+      cvd: S.cvd, bigCvd: S.bigCvd, vol: S.vol, buyVol: S.buyVol, sellVol: S.sellVol,
+      last: S.last, lastT: S.lastT,
+      ladder: [...S.ladder].map(([k, v]) => [+k, v.b, v.s, v.v]),
+      recent: S.recent.slice(-RECENT_MAX),
+    };
+    try {
+      await pgPool.query(
+        `INSERT INTO es_session (ticker, session, data, updated) VALUES ($1,$2,$3,now())
+         ON CONFLICT (ticker, session) DO UPDATE SET data=$3, updated=now()`,
+        [S.ticker, S.sessionDate, JSON.stringify(data)]);
+    } catch (e) { console.warn('[es-feed] store save failed:', e.message); }
+  }
+  // Backfill the restart gap from REST history. Tick-rule side classification.
+  async function backfillGap(sinceMs) {
+    if (!(sinceMs > 0)) return;
+    try {
+      let path = `/futures/v1/trades/${encodeURIComponent(S.ticker)}?timestamp.gt=${Math.floor(sinceMs * 1e6)}&sort=timestamp.asc&limit=5000`;
+      let pages = 0, prev = S.last || 0, n = 0;
+      while (path && pages < 6) {
+        const j = await mget(path);
+        const rows = (j && j.results) || [];
+        for (const r of rows) {
+          const p = num(r.price), s = num(r.size), t = Math.round(num(r.timestamp) / 1e6);
+          if (!(p > 0 && s > 0)) continue;
+          const d = prev > 0 ? (p > prev ? 1 : (p < prev ? -1 : 0)) : 0;
+          applyTrade(p, s, t, d, false);
+          prev = p; n++;
+        }
+        path = (j && j.next_url) ? String(j.next_url).replace(API, '') : null;
+        pages++;
+        if (!rows.length) break;
+      }
+      if (n) console.log(`[es-feed] backfilled ${n} trades from REST (downtime gap)`);
+    } catch (e) { console.warn('[es-feed] backfill failed:', e.message); }
+  }
+  setInterval(storeSave, SAVE_MS);
 
   // ---- Massive socket --------------------------------------------------------
   let ws = null, wsTries = 0, subbed = '';
@@ -324,6 +416,10 @@ function mount(app, opts) {
     S.sessionDate = sessionDate();
     try { await resolveTicker(); } catch (e) { console.error('[es-feed] ticker resolve failed:', e.message); S.ticker = S.ticker || 'ES?'; }
     await fetchAnchor();
+    // restore this session's state (if any), then backfill the restart gap from REST
+    await storeInit();
+    const saved = await storeLoad();
+    if (saved && restoreState(saved) && S.lastT > 0) await backfillGap(S.lastT);
     connect();
   })();
 
