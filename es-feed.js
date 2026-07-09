@@ -117,27 +117,41 @@ function mount(app, opts) {
   async function mget(path) {
     const r = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${KEY}`, Accept: 'application/json' } });
     const j = await r.json().catch(() => null);
-    if (!r.ok) throw new Error((j && (j.error || j.message)) || `massive HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}${j && (j.error || j.message) ? ' — ' + (j.error || j.message) : ''}`);
     return j;
   }
 
-  // Front month: active single contracts for the product, nearest last_trade_date
-  // that is at least MIN_DTM days out (avoids the roll edge). ES_TICKER overrides.
+  // Front month (v2): the v1 query used server-side sort/type filters the contracts
+  // API rejected (REST /trades worked fine, so auth/plan were never the issue). Now we
+  // pull the active board plainly and do ALL filtering client-side:
+  //   single contracts only  = ticker matches  <PRODUCT><month code><year>  (e.g. ESU6)
+  //     — this shape excludes spreads/combos like ESU6-ESZ6 by construction
+  //   front month            = smallest days-to-maturity that is still ≥ MIN_DTM
+  // ES_TICKER env still overrides everything (and disables auto-roll).
+  const SINGLE_RE = new RegExp('^' + PRODUCT + '[FGHJKMNQUVXZ]\\d{1,2}$');
   async function resolveTicker() {
     if (process.env.ES_TICKER) { S.ticker = process.env.ES_TICKER.trim().toUpperCase(); return S.ticker; }
-    const j = await mget(`/futures/v1/contracts?product_code=${encodeURIComponent(PRODUCT)}&active=true&type=single&sort=last_trade_date.asc&limit=20`);
-    const rows = (j && j.results) || [];
-    const now = Date.now();
-    for (const c of rows) {
-      if (!c.ticker || !c.last_trade_date) continue;
-      const dtm = (new Date(c.last_trade_date + 'T21:00:00Z') - now) / 864e5;
-      if (dtm >= MIN_DTM) {
-        if (S.ticker !== c.ticker) console.log('[es-feed] front month →', c.ticker, '(last trade', c.last_trade_date + ')');
-        S.discovered = { ticker: c.ticker, last_trade_date: c.last_trade_date, tick: num(c.trade_tick_size) || 0.25 };
-        return (S.ticker = c.ticker);
-      }
+    let rows = [];
+    try {
+      const j = await mget(`/futures/v1/contracts?product_code=${encodeURIComponent(PRODUCT)}&active=true&limit=1000`);
+      rows = (j && j.results) || [];
+    } catch (e) {
+      console.warn('[es-feed] contracts query (active=true) failed:', e.message, '— retrying plain');
+      const j = await mget(`/futures/v1/contracts?product_code=${encodeURIComponent(PRODUCT)}&limit=1000`);
+      rows = (j && j.results) || [];
     }
-    throw new Error(`no active ${PRODUCT} contract found`);
+    const now = Date.now();
+    const cands = rows
+      .filter(c => c && c.ticker && SINGLE_RE.test(String(c.ticker).toUpperCase())
+        && (c.type == null || c.type === 'single') && c.last_trade_date)
+      .map(c => Object.assign({}, c, { _dtm: (new Date(c.last_trade_date + 'T21:00:00Z') - now) / 864e5 }))
+      .filter(c => c._dtm >= MIN_DTM)
+      .sort((a, b) => a._dtm - b._dtm);
+    if (!cands.length) throw new Error(`no active ${PRODUCT} single contract found (${rows.length} rows returned)`);
+    const c = cands[0];
+    if (S.ticker !== c.ticker) console.log('[es-feed] front month →', c.ticker, '(last trade', c.last_trade_date + ')');
+    S.discovered = { ticker: c.ticker, last_trade_date: c.last_trade_date, tick: num(c.trade_tick_size) || 0.25 };
+    return (S.ticker = c.ticker);
   }
 
   // One REST last-trade → decimal price anchor for the WS scale inference.
