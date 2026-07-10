@@ -60,7 +60,7 @@ function mount(app, opts) {
   // v3: ring big enough that a page refresh reconstructs the FULL 3-minute band
   // window instantly, even on fast tape (~3k prints = several minutes of ES).
   const RECENT_MAX = parseInt(process.env.ES_RECENT || '3000', 10);
-  const FLUSH_MS   = 250;          // SSE batch cadence
+  const FLUSH_MS   = parseInt(process.env.ES_FLUSH_MS || '100', 10);   // SSE batch cadence — 10Hz, DOM-grade
   const BAR_MS     = 1000;         // 1s bars ring (burst z-score source, client-side)
   const BARS_KEEP  = 900;          // 15 min of 1s bars
   const SAVE_MS    = 5000;         // session-state persistence cadence (Postgres)
