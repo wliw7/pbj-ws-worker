@@ -58,7 +58,7 @@ function mount(app, opts) {
   const BIG_SIZE   = parseInt(process.env.ES_BIG_SIZE || '20', 10);
   const MIN_DTM    = 3;            // roll: skip contracts within 3 days of last trade
   // v3: ring big enough that a page refresh reconstructs the FULL 3-minute band
-  // window instantly, even on fast tape (~3k prints ≈ several minutes of ES).
+  // window instantly, even on fast tape (~3k prints = several minutes of ES).
   const RECENT_MAX = parseInt(process.env.ES_RECENT || '3000', 10);
   const FLUSH_MS   = 250;          // SSE batch cadence
   const BAR_MS     = 1000;         // 1s bars ring (burst z-score source, client-side)
@@ -89,7 +89,7 @@ function mount(app, opts) {
     anchor: 0,                   // REST last-trade price (decimal) used to infer scale
     // tape
     bid: 0, ask: 0, bs: 0, as: 0, qt: 0,
-    last: 0, lastT: 0,
+    last: 0, lastT: 0, from: 0,
     cvd: 0, bigCvd: 0, vol: 0, buyVol: 0, sellVol: 0,
     sessionDate: null,           // ET trading date (18:00 ET boundary)
     ladder: new Map(),           // priceKey -> { b, s, v }  (0.25-pt native buckets)
@@ -132,13 +132,9 @@ function mount(app, opts) {
     return j;
   }
 
-  // Front month (v2): the v1 query used server-side sort/type filters the contracts
-  // API rejected (REST /trades worked fine, so auth/plan were never the issue). Now we
-  // pull the active board plainly and do ALL filtering client-side:
-  //   single contracts only  = ticker matches  <PRODUCT><month code><year>  (e.g. ESU6)
-  //     — this shape excludes spreads/combos like ESU6-ESZ6 by construction
-  //   front month            = smallest days-to-maturity that is still ≥ MIN_DTM
-  // ES_TICKER env still overrides everything (and disables auto-roll).
+  // Front month (v2): plain query, ALL filtering client-side. Single contracts only
+  // (ticker shape <PRODUCT><monthCode><year>, e.g. ESU6 — excludes spreads/combos);
+  // nearest days-to-maturity that is still >= MIN_DTM. ES_TICKER overrides (no auto-roll).
   const SINGLE_RE = new RegExp('^' + PRODUCT + '[FGHJKMNQUVXZ]\\d{1,2}$');
   async function resolveTicker() {
     if (process.env.ES_TICKER) { S.ticker = process.env.ES_TICKER.trim().toUpperCase(); return S.ticker; }
@@ -209,8 +205,8 @@ function mount(app, opts) {
   }
   // Core accumulation, shared by the live socket (d from BBO) and the REST gap
   // backfill (d from tick rule). `live` controls SSE fan-out; `noRing` keeps
-  // out-of-order HEAD backfills (older than what we hold) off the ring/bars —
-  // ladder and counters are order-insensitive sums, so those always apply.
+  // out-of-order HEAD backfills off the ring/bars — ladder and counters are
+  // order-insensitive sums, so those always apply.
   function applyTrade(p, s, t, d, live, noRing) {
     if (S.sessionDate !== sessionDate()) resetSession();
     if (noRing) {
@@ -259,11 +255,7 @@ function mount(app, opts) {
     applyTrade(p, s, t, classify(p), true);
   }
 
-  // ---- session persistence (Postgres, optional) + REST gap backfill ----------
-  // Counters/ladder/ring survive worker restarts, so CVD really runs from the
-  // Globex open. On boot with saved state from the SAME session, the downtime gap
-  // is backfilled from Massive's REST trades (tick-rule classified — no BBO in
-  // history; gaps are ~a minute, so the approximation is immaterial).
+  // ---- session persistence (Postgres, optional) + REST gap/head backfill -----
   let pgPool = null, storeDirty = false;
   function initStore() {
     const url = (process.env.DATABASE_URL || '').trim();
@@ -294,7 +286,7 @@ function mount(app, opts) {
       S.cvd = num(d.cvd); S.bigCvd = num(d.bigCvd); S.vol = num(d.vol);
       S.buyVol = num(d.buyVol); S.sellVol = num(d.sellVol);
       S.last = num(d.last) || 0; S.lastT = num(d.lastT) || 0;
-      S.from = num(d.from) || 0;   // 0 = legacy row (pre-v3.2) — coverage start unknown
+      S.from = num(d.from) || 0;   // 0 = legacy row — coverage start unknown
       S.ladder = new Map((d.ladder || []).map(r => [(+r[0]).toFixed(2), { b: num(r[1]), s: num(r[2]), v: num(r[3]) }]));
       S.recent = Array.isArray(d.recent) ? d.recent.slice(-RECENT_MAX) : [];
       console.log(`[es-feed] restored session ${S.sessionDate}: vol ${S.vol}, cvd ${S.cvd}, ladder ${S.ladder.size} px, ring ${S.recent.length}`);
@@ -317,10 +309,8 @@ function mount(app, opts) {
         [S.ticker, S.sessionDate, JSON.stringify(data)]);
     } catch (e) { console.warn('[es-feed] store save failed:', e.message); }
   }
-  // Backfill from REST history — restart gaps (few pages) OR, on the first boot of
-  // a session with nothing saved, the ENTIRE session so far (up to ~2M prints; they
-  // fold into the ladder/counters and only the last RECENT_MAX stay in the ring).
-  // Tick-rule side classification (history carries no BBO); live tape stays BBO-classified.
+  // Backfill from REST history — restart gaps OR (first boot of a session) the whole
+  // session. Tick-rule side classification (history carries no BBO).
   async function backfillGap(sinceMs, maxPages, untilMs, noRing) {
     if (!(sinceMs > 0)) return;
     maxPages = maxPages || 6;
@@ -428,6 +418,27 @@ function mount(app, opts) {
     });
   });
   app.get('/es/state', founder, (_req, res) => { res.set('Cache-Control', 'no-store'); res.json(snapshot()); });
+  // v3.3 — ES candles straight from Massive aggregates (real-time on Advanced),
+  // so the Edge chart never depends on Yahoo. Cached 20s per timeframe.
+  const AGG_TF = { '5m': '5min', '15m': '15min', '1h': '1hour' };
+  const candleCache = {};
+  app.get('/es/candles', founder, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const tf = AGG_TF[req.query.tf] ? String(req.query.tf) : '5m';
+    const hit = candleCache[tf];
+    if (hit && Date.now() - hit.ts < 20000) return res.json(hit.data);
+    try {
+      const lim = tf === '5m' ? 600 : (tf === '15m' ? 500 : 400);
+      const j = await mget(`/futures/v1/aggs/${encodeURIComponent(S.ticker)}?resolution=${AGG_TF[tf]}&limit=${lim}`);
+      const series = ((j && j.results) || [])
+        .map(r => ({ t: Math.floor(num(r.window_start) / 1e9), o: num(r.open), h: num(r.high), l: num(r.low), c: num(r.close), v: num(r.volume) }))
+        .filter(r => r.t > 0 && r.o > 0)
+        .sort((a, b) => a.t - b.t);
+      const data = { ticker: S.ticker, tf, series };
+      if (series.length) candleCache[tf] = { ts: Date.now(), data };
+      res.json(data);
+    } catch (e) { res.status(502).json({ error: e.message }); }
+  });
   app.get('/es/stream', founder, (req, res) => {
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.flushHeaders && res.flushHeaders();
@@ -444,22 +455,18 @@ function mount(app, opts) {
     S.sessionDate = sessionDate();
     try { await resolveTicker(); } catch (e) { console.error('[es-feed] ticker resolve failed:', e.message); S.ticker = S.ticker || 'ES?'; }
     await fetchAnchor();
-    // restore this session's state (if any), then make coverage COMPLETE from the
-    // Globex open via REST:
-    //   saved state, full coverage    -> backfill just the restart gap (quick)
-    //   saved state, started mid-day  -> ALSO backfill the missing head
-    //                                    (ladder/counters only — order-insensitive)
-    //   nothing saved / ES_REBUILD=1  -> rebuild the whole session from the open
+    // restore this session's state, then make coverage COMPLETE from the Globex open:
+    //   saved, full coverage   -> backfill just the restart gap (quick)
+    //   saved, started mid-day -> ALSO backfill the missing head (ladder/counters only)
+    //   nothing / legacy row / ES_REBUILD=1 -> rebuild the whole session from the open
     await storeInit();
     let saved = process.env.ES_REBUILD === '1' ? null : await storeLoad();
-    // a legacy row (saved before coverage tracking) can't be safely head-filled
-    // without double counting — rebuild it from REST instead (one-time cost)
     if (saved && !num(saved.from)) { console.log('[es-feed] saved state has no coverage info — rebuilding instead'); saved = null; }
     const sStart = sessionStartMs();
     if (saved && restoreState(saved)) {
       if (process.env.ES_BACKFILL !== '0' && S.from - sStart > 120000) {
         console.log('[es-feed] saved state starts mid-session — backfilling the missing head…');
-        await backfillGap(sStart, 60, S.from, true);   // ladder/counters only, bounded at coverage start
+        await backfillGap(sStart, 60, S.from, true);
         S.from = sStart;
       }
       if (S.lastT > 0) await backfillGap(S.lastT, 6);
